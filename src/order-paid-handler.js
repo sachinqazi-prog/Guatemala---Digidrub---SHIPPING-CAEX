@@ -67,10 +67,22 @@ function sleep(ms) {
 }
 
 /**
- * Shopify doesn't always have fulfillment orders ready the instant an
- * order webhook fires (race condition, seen in testing — first attempt
- * came back empty, order existed fine). Retry a few times with a short
- * delay before giving up, instead of failing on the first empty result.
+ * In-process lock. Prevents the exact race condition seen in testing:
+ * Shopify delivered the same order-paid webhook twice within ~7 seconds
+ * (likely a retry after our handler took too long to respond). Both
+ * deliveries passed the "does a guide already exist?" check before
+ * either had finished — the Shopify-based check alone isn't enough to
+ * stop two requests that are in flight at the same time. This Set
+ * blocks a second concurrent run for the same order while the first is
+ * still working. It resets on restart, which is fine — the persisted
+ * Shopify check (alreadyHasCaexGuide) still catches true duplicates
+ * across restarts; this only needs to catch same-process races.
+ */
+const processingOrders = new Set();
+
+/**
+ * Shopify fulfillment orders aren't always ready the instant an order
+ * webhook fires. Retry a few times with a short delay before giving up.
  */
 async function getFulfillmentOrdersWithRetry(orderId, { attempts = 4, delayMs = 2000 } = {}) {
   for (let i = 0; i < attempts; i++) {
@@ -92,16 +104,98 @@ async function getFulfillmentOrdersWithRetry(orderId, { attempts = 4, delayMs = 
 
 /**
  * Dedup guard: check Shopify itself for an existing CAEX fulfillment on
- * this order before calling generateGuide() again. This is safer than
- * an in-memory flag because it survives server restarts/redeploys and
- * works correctly even if Render ever runs more than one instance —
- * Shopify is the single source of truth here, not this process's memory.
+ * this order before calling generateGuide() again. Survives restarts,
+ * unlike an in-memory-only flag.
  */
 async function alreadyHasCaexGuide(orderId) {
   const fulfillments = await getFulfillments(orderId);
   return fulfillments.some(
     (f) => (f.tracking_company || '').toUpperCase() === 'CAEX' && f.tracking_number
   );
+}
+
+/**
+ * Pulls the useful part out of a failed axios call — Shopify's 4xx/5xx
+ * responses carry a JSON body explaining exactly what was wrong
+ * (e.g. {"errors":"..."}), which err.message alone never shows. Every
+ * catch block below should log through this instead of err.message.
+ */
+function describeAxiosError(err) {
+  if (err?.response) {
+    return {
+      status: err.response.status,
+      body: err.response.data,
+    };
+  }
+  return { message: err?.message || String(err) };
+}
+
+/**
+ * The actual guide-generation + fulfillment work, split out so it can
+ * run AFTER we've already responded 200 to Shopify (see handleOrderPaid
+ * below). Keeping Shopify's webhook response fast prevents it from
+ * treating a slow CAEX/Shopify round-trip as a timeout and re-delivering
+ * the same webhook — which is what caused the duplicate-guide race seen
+ * in testing.
+ */
+async function processGuideGeneration(order, meta) {
+  const orderId = order.id;
+
+  if (processingOrders.has(orderId)) {
+    log.info('Order already being processed in this run — skipping duplicate', { orderId });
+    return;
+  }
+  processingOrders.add(orderId);
+
+  try {
+    if (await alreadyHasCaexGuide(orderId)) {
+      log.info('CAEX guide already exists for this order — skipping duplicate call', {
+        orderId,
+        orderName: order?.name,
+      });
+      return;
+    }
+
+    const guideInput = buildGuidePayload(order);
+
+    let guideResult;
+    try {
+      guideResult = await generateGuide(guideInput);
+    } catch (err) {
+      log.error('generateGuide failed', { orderId, ...describeAxiosError(err) });
+      return;
+    }
+
+    const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
+    const firstFulfillmentOrder = fulfillmentOrders[0];
+
+    if (!firstFulfillmentOrder) {
+      log.warn('Guide created but no fulfillment order found after retries', {
+        orderId,
+        trackingNumber: guideResult.trackingNumber,
+      });
+      return;
+    }
+
+    try {
+      await createFulfillmentWithTracking({
+        orderId,
+        fulfillmentOrderId: firstFulfillmentOrder.id,
+        trackingNumber: guideResult.trackingNumber,
+        trackingUrl: guideResult.trackingUrl,
+      });
+    } catch (err) {
+      log.error('createFulfillmentWithTracking failed', { orderId, ...describeAxiosError(err) });
+      return;
+    }
+
+    log.info('Guide created and fulfillment updated', {
+      orderId,
+      trackingNumber: guideResult.trackingNumber,
+    });
+  } finally {
+    processingOrders.delete(orderId);
+  }
 }
 
 export async function handleOrderPaid(req, res) {
@@ -154,46 +248,22 @@ export async function handleOrderPaid(req, res) {
       return res.status(200).send('No guide required');
     }
 
-    // Dedup guard — Shopify can fire this webhook more than once for the
-    // same order (seen in testing: two hits ~7s apart). Check whether a
-    // CAEX guide already exists on this order before generating another.
-    if (await alreadyHasCaexGuide(orderId)) {
-      log.info('CAEX guide already exists for this order — skipping duplicate call', {
-        orderId,
-        orderName: order?.name,
-      });
-      return res.status(200).send('Guide already exists');
-    }
+    // Respond to Shopify NOW. The remaining work (CAEX SOAP call +
+    // Shopify fulfillment update) can take several seconds, and a slow
+    // response was very likely why Shopify re-delivered this webhook in
+    // testing, which raced two guide-generation attempts against each
+    // other. Everything after this point runs in the background — the
+    // in-process lock and the Shopify-based dedup check inside
+    // processGuideGeneration still protect against duplicates even if
+    // Shopify sends this webhook again anyway.
+    res.status(200).send('Accepted');
 
-    const guideInput = buildGuidePayload(order);
-    const guideResult = await generateGuide(guideInput);
-
-    const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
-    const firstFulfillmentOrder = fulfillmentOrders[0];
-
-    if (!firstFulfillmentOrder) {
-      log.warn('Guide created but no fulfillment order found after retries', {
-        orderId,
-        trackingNumber: guideResult.trackingNumber,
-      });
-      return res.status(200).send('Guide created; no fulfillment order found');
-    }
-
-    await createFulfillmentWithTracking({
-      orderId,
-      fulfillmentOrderId: firstFulfillmentOrder.id,
-      trackingNumber: guideResult.trackingNumber,
-      trackingUrl: guideResult.trackingUrl,
+    processGuideGeneration(order, meta).catch((err) => {
+      log.error('processGuideGeneration crashed', { orderId, ...describeAxiosError(err) });
     });
-
-    log.info('Guide created and fulfillment updated', {
-      orderId,
-      trackingNumber: guideResult.trackingNumber,
-    });
-
-    return res.status(200).send('OK');
+    return;
   } catch (err) {
-    log.error('order-paid webhook failed', err.stack || err.message);
+    log.error('order-paid webhook failed', { ...describeAxiosError(err), stack: err.stack });
     return res.status(500).send('Webhook failed');
   }
 }

@@ -74,7 +74,20 @@ export async function handleOrderPaid(req, res) {
       return res.status(400).send('Missing order id');
     }
 
-    const order = await getOrder(orderId);
+      const order = await getOrder(orderId);
+
+    // Safety check: this handler now also gets called from the
+    // "Order creation" webhook topic, which fires BEFORE payment is
+    // confirmed. Bail out early if the order isn't actually paid yet.
+    if (order?.financial_status !== 'paid') {
+      log.info('Order not yet paid — skipping guide generation', {
+        orderId,
+        orderName: order?.name,
+        financialStatus: order?.financial_status,
+      });
+      return res.status(200).send('Order not paid yet');
+    }
+
     const serviceCode = getChosenServiceCode(order);
 
     log.info('Order paid webhook received', {

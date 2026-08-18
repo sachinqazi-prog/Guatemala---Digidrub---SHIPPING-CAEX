@@ -40,8 +40,17 @@ export async function createFulfillmentWithTracking({
       notify_customer: false,
     },
   };
-  const { data } = await client.post('/fulfillments.json', body);
-  return data;
+  try {
+    const { data } = await client.post('/fulfillments.json', body);
+    return data;
+  } catch (err) {
+    // Attach Shopify's actual error body to the error so callers can log
+    // the real reason (e.g. "already fulfilled") instead of just "422".
+    if (err.response) {
+      err.shopifyError = err.response.data;
+    }
+    throw err;
+  }
 }
 export async function getFulfillmentOrders(orderId) {
   const client = adminClient();

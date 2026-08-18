@@ -129,64 +129,152 @@ export async function getPoblados(codigoDepartamento) {
   return Array.isArray(list) ? list : list ? [list] : [];
 }
 
+/**
+ * Build a single <Pieza> node for the Piezas list.
+ * CAEX doesn't publish the internal Pieza schema in the public op docs
+ * (it shows as xsi:nil in the sample), so this uses the same field names
+ * as ObtenerTarifaEnvio's package-level inputs. CONFIRM against a real
+ * CAEX response/support ticket before relying on this in production —
+ * if CAEX rejects it, ask their support for a working Pieza example.
+ */
+function piezaXml({ peso, alto, ancho, largo, valorDeclarado, descripcion }) {
+  return `<Pieza>
+        <Peso>${peso ?? 1}</Peso>
+        <Alto>${alto ?? 1}</Alto>
+        <Ancho>${ancho ?? 1}</Ancho>
+        <Largo>${largo ?? 1}</Largo>
+        <ValorDeclarado>${valorDeclarado ?? 0}</ValorDeclarado>
+        <Descripcion>${descripcion ? escapeXml(descripcion) : 'Mercaderia'}</Descripcion>
+      </Pieza>`;
+}
+
+/**
+ * Generate one or more shipping guides via GenerarGuia.
+ *
+ * CAEX's GenerarGuia takes a LIST of recolecciones (pickups), each of
+ * which can contain multiple Piezas (packages). This wraps a single
+ * order into that shape. Pass `recolecciones: [...]` directly if you
+ * ever need to batch multiple orders in one call.
+ *
+ * Required-looking fields per CAEX's published schema:
+ *   RecoleccionID, RemitenteNombre/Direccion/Telefono,
+ *   DestinatarioNombre/Direccion/Telefono, CodigoPobladoOrigen/Destino,
+ *   TipoServicio, CodigoCredito, TipoEntrega, FechaRecoleccion, Piezas
+ *
+ * `TokenDireccion` shows up in CAEX's schema but there's no confirmed
+ * source for it yet in this integration — it likely comes from a
+ * separate address-validation/tokenization operation on the CAEX WSDL.
+ * Sending it empty for now; if CAEX starts rejecting requests for this
+ * reason, check the full operations list at
+ * https://ws.caexlogistics.com/wsCAEXLogisticsSB/wsCAEXLogisticsSB.asmx
+ * for an address-token operation and call it first.
+ */
 export async function generateGuide({
-  codigoDespacho,
+  recoleccionId,
+  remitenteNombre,
+  remitenteDireccion,
+  remitenteTelefono,
   customerName,
   phone,
-  email,
   address1,
   address2,
-  city,
-  province,
-  deptCode,
-  destPobladoCode,
+  nit,
   reference,
-  amount,
+  referencia2,
+  destPobladoCode,
+  origenPobladoCode,
+  servicio,
+  montoCOD,
+  formatoImpresion,
+  montoAsegurado,
+  observaciones,
+  codigoReferencia,
+  fechaRecoleccion,
+  tipoEntrega,
+  tokenDireccion,
+  piezas,
 }) {
-  // IMPORTANT:
-  // Replace this XML with the real CAEX GenerarGuia template.
+  const direccionCompleta = [address1, address2].filter(Boolean).join(', ');
+
+  const piezasArray = Array.isArray(piezas) && piezas.length > 0 ? piezas : [{}];
+  const piezasXml = piezasArray.map(piezaXml).join('\n        ');
+
+  const datosRecoleccionXml = `<DatosRecoleccion>
+        <RecoleccionID>${escapeXml(recoleccionId)}</RecoleccionID>
+        <RemitenteNombre>${escapeXml(remitenteNombre || process.env.CAEX_REMITENTE_NOMBRE)}</RemitenteNombre>
+        <RemitenteDireccion>${escapeXml(remitenteDireccion || process.env.CAEX_REMITENTE_DIRECCION)}</RemitenteDireccion>
+        <RemitenteTelefono>${escapeXml(remitenteTelefono || process.env.CAEX_REMITENTE_TELEFONO)}</RemitenteTelefono>
+        <DestinatarioNombre>${escapeXml(customerName)}</DestinatarioNombre>
+        <DestinatarioDireccion>${escapeXml(direccionCompleta)}</DestinatarioDireccion>
+        <DestinatarioTelefono>${escapeXml(phone)}</DestinatarioTelefono>
+        <DestinatarioContacto>${escapeXml(customerName)}</DestinatarioContacto>
+        <DestinatarioNIT>${escapeXml(nit || 'CF')}</DestinatarioNIT>
+        <ReferenciaCliente1>${escapeXml(reference)}</ReferenciaCliente1>
+        <ReferenciaCliente2>${escapeXml(referencia2 || '')}</ReferenciaCliente2>
+        <CodigoPobladoDestino>${escapeXml(destPobladoCode)}</CodigoPobladoDestino>
+        <CodigoPobladoOrigen>${escapeXml(origenPobladoCode || process.env.CAEX_ORIGEN_POBLADO)}</CodigoPobladoOrigen>
+        <TipoServicio>${escapeXml(servicio || process.env.CAEX_DEFAULT_SERVICIO)}</TipoServicio>
+        <MontoCOD>${montoCOD ?? 0}</MontoCOD>
+        <FormatoImpresion>${escapeXml(formatoImpresion || process.env.CAEX_FORMATO_IMPRESION || 'PDF')}</FormatoImpresion>
+        <CodigoCredito>${escapeXml(process.env.CAEX_CREDITO)}</CodigoCredito>
+        <MontoAsegurado>${montoAsegurado ?? 0}</MontoAsegurado>
+        <Observaciones>${escapeXml(observaciones || '')}</Observaciones>
+        <CodigoReferencia>${codigoReferencia ?? 0}</CodigoReferencia>
+        <FechaRecoleccion>${fechaRecoleccion || new Date().toISOString()}</FechaRecoleccion>
+        <TipoEntrega>${tipoEntrega ?? process.env.CAEX_DEFAULT_ENTREGA}</TipoEntrega>
+        <TokenDireccion>${escapeXml(tokenDireccion || '')}</TokenDireccion>
+        <Piezas>
+        ${piezasXml}
+        </Piezas>
+      </DatosRecoleccion>`;
+
   const body = `<GenerarGuia xmlns="${CAEX_NS}">
       ${authXml()}
-      <DatosGuia>
-        <CodigoCredito>${process.env.CAEX_CREDITO}</CodigoCredito>
-        <CodigoDespacho>${codigoDespacho}</CodigoDespacho>
-        <CodigoPobladoOrigen>${process.env.CAEX_ORIGEN_POBLADO}</CodigoPobladoOrigen>
-        <CodigoPobladoDestino>${destPobladoCode}</CodigoPobladoDestino>
-        <NombreDestinatario>${escapeXml(customerName)}</NombreDestinatario>
-        <TelefonoDestinatario>${escapeXml(phone)}</TelefonoDestinatario>
-        <EmailDestinatario>${escapeXml(email)}</EmailDestinatario>
-        <Direccion1>${escapeXml(address1)}</Direccion1>
-        <Direccion2>${escapeXml(address2 || '')}</Direccion2>
-        <Ciudad>${escapeXml(city)}</Ciudad>
-        <Departamento>${escapeXml(province)}</Departamento>
-        <Referencia>${escapeXml(reference)}</Referencia>
-        <Valor>${escapeXml(String(amount || '0'))}</Valor>
-      </DatosGuia>
+      <ListaRecolecciones>
+        ${datosRecoleccionXml}
+      </ListaRecolecciones>
     </GenerarGuia>`;
 
   const response = await soapCall('GenerarGuia', body);
 
-  // IMPORTANT:
-  // Adjust these paths after you get the real CAEX response example.
-  const result = response?.ResultadoGenerarGuia || response;
-  const opResult = result?.ResultadoOperacion;
+  const result = response?.ResultadoGenerarGuia;
+  const opResult = result?.ResultadoOperacionMultiple;
 
-  if (opResult?.ResultadoExitoso === true || opResult?.ResultadoExitoso === 'true') {
+  if (!(opResult?.ResultadoExitoso === true || opResult?.ResultadoExitoso === 'true')) {
     return {
-      success: true,
-      trackingNumber:
-        result?.NumeroGuia ||
-        result?.Guia ||
-        result?.TrackingNumber,
-      trackingUrl:
-        result?.UrlRastreo || null,
+      success: false,
+      error: opResult?.MensajeError || 'Unknown CAEX GenerarGuia error',
+      code: opResult?.CodigoRespuesta,
       raw: result,
     };
   }
 
+  let recolecciones = result?.ListaRecolecciones?.DatosRecoleccion;
+  recolecciones = Array.isArray(recolecciones) ? recolecciones : recolecciones ? [recolecciones] : [];
+
+  // Per-item results — each recoleccion has its own ResultadoOperacion.
+  const items = recolecciones.map((r) => ({
+    recoleccionId: r.RecoleccionID,
+    piezaNumero: r.NumeroPieza,
+    trackingNumber: r.NumeroGuia,
+    rate: r.MontoTarifa != null ? parseFloat(r.MontoTarifa) : null,
+    trackingUrl: r.URLConsulta || null,
+    pickupUrl: r.URLRecoleccion || null,
+    success:
+      r?.ResultadoOperacion?.ResultadoExitoso === true ||
+      r?.ResultadoOperacion?.ResultadoExitoso === 'true',
+    error: r?.ResultadoOperacion?.MensajeError || null,
+  }));
+
+  const first = items[0] || {};
+
   return {
-    success: false,
-    error: opResult?.MensajeError || 'Unknown CAEX GenerarGuia error',
+    success: true,
+    // Convenience top-level fields for the common single-order case:
+    trackingNumber: first.trackingNumber,
+    trackingUrl: first.trackingUrl,
+    // Full list, in case multiple recolecciones/piezas were sent:
+    items,
     raw: result,
   };
 }

@@ -1,5 +1,10 @@
 import crypto from 'node:crypto';
-import { getOrder, getFulfillmentOrders, createFulfillmentWithTracking } from './shopify.js';
+import {
+  getOrder,
+  getFulfillmentOrders,
+  getFulfillments,
+  createFulfillmentWithTracking,
+} from './shopify.js';
 import { getServiceCodeMeta } from './shipping-rules.js';
 import { generateGuide } from './caex.js';
 import { resolveDepartamento } from './province-mapping.js';
@@ -9,15 +14,12 @@ import { log } from './logger.js';
 function verifyShopifyWebhook(req) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
   if (!secret) return true; // allow in local dev if not set
-
   const hmacHeader = req.get('X-Shopify-Hmac-Sha256');
   const rawBody = req.rawBody || '';
-
   const digest = crypto
     .createHmac('sha256', secret)
     .update(rawBody, 'utf8')
     .digest('base64');
-
   return crypto.timingSafeEqual(
     Buffer.from(digest),
     Buffer.from(hmacHeader || '')
@@ -25,7 +27,6 @@ function verifyShopifyWebhook(req) {
 }
 
 function getChosenServiceCode(order) {
-  // Primary source: shipping_lines[0].code
   const shippingLine = order?.shipping_lines?.[0];
   return shippingLine?.code || shippingLine?.source || null;
 }
@@ -36,9 +37,7 @@ function buildGuidePayload(order) {
     province: shippingAddress?.province,
     province_code: shippingAddress?.province_code,
   });
-
   const destPobladoCode = findPobladoCode(shippingAddress?.city, deptCode);
-
   return {
     orderId: order.id,
     codigoDespacho: 8,
@@ -60,6 +59,51 @@ function buildGuidePayload(order) {
   };
 }
 
+/**
+ * Simple sleep helper for the retry loop below.
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Shopify doesn't always have fulfillment orders ready the instant an
+ * order webhook fires (race condition, seen in testing — first attempt
+ * came back empty, order existed fine). Retry a few times with a short
+ * delay before giving up, instead of failing on the first empty result.
+ */
+async function getFulfillmentOrdersWithRetry(orderId, { attempts = 4, delayMs = 2000 } = {}) {
+  for (let i = 0; i < attempts; i++) {
+    const fulfillmentOrders = await getFulfillmentOrders(orderId);
+    if (fulfillmentOrders.length > 0) {
+      return fulfillmentOrders;
+    }
+    log.info('No fulfillment orders yet — retrying', {
+      orderId,
+      attempt: i + 1,
+      attempts,
+    });
+    if (i < attempts - 1) {
+      await sleep(delayMs);
+    }
+  }
+  return [];
+}
+
+/**
+ * Dedup guard: check Shopify itself for an existing CAEX fulfillment on
+ * this order before calling generateGuide() again. This is safer than
+ * an in-memory flag because it survives server restarts/redeploys and
+ * works correctly even if Render ever runs more than one instance —
+ * Shopify is the single source of truth here, not this process's memory.
+ */
+async function alreadyHasCaexGuide(orderId) {
+  const fulfillments = await getFulfillments(orderId);
+  return fulfillments.some(
+    (f) => (f.tracking_company || '').toUpperCase() === 'CAEX' && f.tracking_number
+  );
+}
+
 export async function handleOrderPaid(req, res) {
   try {
     if (!verifyShopifyWebhook(req)) {
@@ -69,16 +113,15 @@ export async function handleOrderPaid(req, res) {
 
     const webhookOrder = req.body;
     const orderId = webhookOrder?.id;
-
     if (!orderId) {
       return res.status(400).send('Missing order id');
     }
 
-      const order = await getOrder(orderId);
+    const order = await getOrder(orderId);
 
-    // Safety check: this handler now also gets called from the
-    // "Order creation" webhook topic, which fires BEFORE payment is
-    // confirmed. Bail out early if the order isn't actually paid yet.
+    // Safety check: this handler also gets called from the "Order
+    // creation" webhook topic, which fires BEFORE payment is confirmed.
+    // Bail out early if the order isn't actually paid yet.
     if (order?.financial_status !== 'paid') {
       log.info('Order not yet paid — skipping guide generation', {
         orderId,
@@ -97,7 +140,6 @@ export async function handleOrderPaid(req, res) {
     });
 
     const meta = getServiceCodeMeta(serviceCode);
-
     if (!meta) {
       log.warn('Unknown service code on paid order', { orderId, serviceCode });
       return res.status(200).send('Unknown service code');
@@ -112,14 +154,25 @@ export async function handleOrderPaid(req, res) {
       return res.status(200).send('No guide required');
     }
 
+    // Dedup guard — Shopify can fire this webhook more than once for the
+    // same order (seen in testing: two hits ~7s apart). Check whether a
+    // CAEX guide already exists on this order before generating another.
+    if (await alreadyHasCaexGuide(orderId)) {
+      log.info('CAEX guide already exists for this order — skipping duplicate call', {
+        orderId,
+        orderName: order?.name,
+      });
+      return res.status(200).send('Guide already exists');
+    }
+
     const guideInput = buildGuidePayload(order);
     const guideResult = await generateGuide(guideInput);
 
-    const fulfillmentOrders = await getFulfillmentOrders(orderId);
+    const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
     const firstFulfillmentOrder = fulfillmentOrders[0];
 
     if (!firstFulfillmentOrder) {
-      log.warn('Guide created but no fulfillment order found', {
+      log.warn('Guide created but no fulfillment order found after retries', {
         orderId,
         trackingNumber: guideResult.trackingNumber,
       });

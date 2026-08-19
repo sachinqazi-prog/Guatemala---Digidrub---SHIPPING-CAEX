@@ -31,13 +31,63 @@ function getChosenServiceCode(order) {
   return shippingLine?.code || shippingLine?.source || null;
 }
 
+/**
+ * Shopify order note_attributes are just an array of {name, value}
+ * pairs — turn that into a lookup map so specific fields can be pulled
+ * out by name.
+ */
+function noteAttributesMap(order) {
+  const attrs = order?.note_attributes || [];
+  const map = {};
+  for (const attr of attrs) {
+    if (attr?.name) map[attr.name] = attr.value;
+  }
+  return map;
+}
+
 function buildGuidePayload(order) {
   const shippingAddress = order?.shipping_address || {};
-  const deptCode = resolveDepartamento({
-    province: shippingAddress?.province,
-    province_code: shippingAddress?.province_code,
-  });
-  const destPobladoCode = findPobladoCode(shippingAddress?.city, deptCode);
+  const notes = noteAttributesMap(order);
+
+  // Prefer the precise CAEX poblado code when the checkout already
+  // captured one (seen on real orders as _caex_poblado_id /
+  // _caex_departamento_id note attributes — some part of checkout,
+  // possibly the "Product Sync Guatemala" app, resolves this exactly).
+  // Fall back to fuzzy city-name matching only when those aren't
+  // present. This matters because the fuzzy fallback was found to
+  // silently default to "the first poblado in the department" on any
+  // miss, which was causing CAEX to reject guides with a same-day
+  // delivery error — it wasn't a same-day problem, it was routing to
+  // the wrong destination entirely.
+  const preciseDeptCode = notes['_caex_departamento_id'];
+  const precisePobladoCode = notes['_caex_poblado_id'];
+
+  let deptCode;
+  let destPobladoCode;
+
+  if (preciseDeptCode && precisePobladoCode) {
+    deptCode = preciseDeptCode;
+    destPobladoCode = precisePobladoCode;
+    log.info('Using precise CAEX poblado from order note attributes', {
+      orderId: order.id,
+      deptCode,
+      destPobladoCode,
+      pobladoName: notes['_caex_poblado_name'],
+    });
+  } else {
+    deptCode = resolveDepartamento({
+      province: shippingAddress?.province,
+      province_code: shippingAddress?.province_code,
+    });
+    destPobladoCode = findPobladoCode(shippingAddress?.city, deptCode);
+    log.info('No precise CAEX poblado on order — using fuzzy city match', {
+      orderId: order.id,
+      city: shippingAddress?.city,
+      deptCode,
+      destPobladoCode,
+    });
+  }
+
   return {
     orderId: order.id,
     codigoDespacho: 8,

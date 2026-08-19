@@ -161,7 +161,14 @@ export async function generateGuideDebugNilPiezas(input) {
   const direccionCompleta = [guideInput.address1, guideInput.address2].filter(Boolean).join(', ');
   const recoleccionId = String(guideInput.reference || guideInput.orderId || '');
 
-  const body = `<GenerarGuia xmlns="${CAEX_NS}">
+  // NOTE: this debug variant uses xsi:nil, so it needs its own envelope
+  // with the xsi namespace declared (soapCall()'s shared envelope
+  // doesn't declare it, since nothing else in this app uses xsi:nil).
+  // Without this, CAEX's server sees an undefined namespace prefix and
+  // rejects the whole request as malformed XML with a raw 400 — which
+  // is what happened on the first attempt. That 400 was our own bug,
+  // not a real signal about CAEX's schema.
+  const bodyXml = `<GenerarGuia xmlns="${CAEX_NS}">
       ${authXml()}
       <ListaRecolecciones>
         <DatosRecoleccion>
@@ -195,10 +202,31 @@ export async function generateGuideDebugNilPiezas(input) {
       </ListaRecolecciones>
     </GenerarGuia>`;
 
-  log.info('CAEX GenerarGuia DEBUG (nil Piezas) outgoing request', body);
-  const response = await soapCall('GenerarGuia', body);
-  log.info('CAEX GenerarGuia DEBUG (nil Piezas) response', JSON.stringify(response));
-  return response;
+  // Custom envelope WITH xsi declared, bypassing the shared soapCall()
+  // helper's envelope (which doesn't declare xsi).
+  const envelope = `<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
+  <soap:Body>
+    ${bodyXml}
+  </soap:Body>
+</soap:Envelope>`;
+
+  const url = process.env.CAEX_URL;
+  const soapAction = `"${CAEX_NS}/GenerarGuia"`;
+
+  log.info('CAEX GenerarGuia DEBUG (nil Piezas) outgoing request', envelope);
+
+  const { data } = await axios.post(url, envelope, {
+    headers: {
+      'Content-Type': 'text/xml; charset=utf-8',
+      'SOAPAction': soapAction,
+    },
+    timeout: Number(process.env.CAEX_TIMEOUT_MS) || 8000,
+  });
+
+  log.info('CAEX GenerarGuia DEBUG (nil Piezas) raw response', data);
+  const parsed = parser.parse(data);
+  return parsed?.Envelope?.Body;
 }
 
 /**

@@ -132,13 +132,17 @@ export async function getPoblados(codigoDepartamento) {
 /**
  * Build a single <Pieza> node for the Piezas list.
  * CAEX doesn't publish the internal Pieza schema in the public op docs
- * (it shows as xsi:nil in the sample), so this uses the same field names
- * as ObtenerTarifaEnvio's package-level inputs. CONFIRM against a real
- * CAEX response/support ticket before relying on this in production —
- * if CAEX rejects it, ask their support for a working Pieza example.
+ * (it shows as xsi:nil in the sample). Field names below are a best
+ * guess based on CAEX's naming conventions elsewhere in the WSDL, plus
+ * the CodigoPieza value we already know is real (used successfully in
+ * ObtenerTarifaEnvio via CAEX_DEFAULT_PIEZA). NOT CONFIRMED — if CAEX
+ * rejects the request specifically on a Pieza field, that's the first
+ * place to check; ask CAEX support for a working GenerarGuia example
+ * with real Piezas if this turns out to be wrong.
  */
-function piezaXml({ peso, alto, ancho, largo, valorDeclarado, descripcion }) {
+function piezaXml({ peso, alto, ancho, largo, valorDeclarado, descripcion, codigoPieza } = {}) {
   return `<Pieza>
+        <CodigoPieza>${escapeXml(codigoPieza || process.env.CAEX_DEFAULT_PIEZA)}</CodigoPieza>
         <Peso>${peso ?? 1}</Peso>
         <Alto>${alto ?? 1}</Alto>
         <Ancho>${ancho ?? 1}</Ancho>
@@ -149,80 +153,74 @@ function piezaXml({ peso, alto, ancho, largo, valorDeclarado, descripcion }) {
 }
 
 /**
- * Generate one or more shipping guides via GenerarGuia.
+ * Generate a shipping guide via GenerarGuia.
  *
- * CAEX's GenerarGuia takes a LIST of recolecciones (pickups), each of
- * which can contain multiple Piezas (packages). This wraps a single
- * order into that shape. Pass `recolecciones: [...]` directly if you
- * ever need to batch multiple orders in one call.
+ * Accepts the SAME shape that order-paid-handler.js's buildGuidePayload()
+ * already produces, so the caller needs no changes:
+ *   { orderId, codigoDespacho, customerName, phone, email, address1,
+ *     address2, city, province, deptCode, destPobladoCode, reference, amount }
  *
- * Required-looking fields per CAEX's published schema:
- *   RecoleccionID, RemitenteNombre/Direccion/Telefono,
- *   DestinatarioNombre/Direccion/Telefono, CodigoPobladoOrigen/Destino,
- *   TipoServicio, CodigoCredito, TipoEntrega, FechaRecoleccion, Piezas
+ * Internally this maps that payload onto CAEX's real GenerarGuia schema —
+ * ListaRecolecciones > DatosRecoleccion — filling in fields the handler
+ * doesn't send (sender/shipper info, package pieces) from env vars and
+ * sane defaults.
  *
- * `TokenDireccion` shows up in CAEX's schema but there's no confirmed
- * source for it yet in this integration — it likely comes from a
- * separate address-validation/tokenization operation on the CAEX WSDL.
- * Sending it empty for now; if CAEX starts rejecting requests for this
- * reason, check the full operations list at
- * https://ws.caexlogistics.com/wsCAEXLogisticsSB/wsCAEXLogisticsSB.asmx
- * for an address-token operation and call it first.
+ * Known gaps, flagged rather than silently guessed:
+ * - `TokenDireccion`: no confirmed source yet. Sent empty. If CAEX starts
+ *   rejecting requests, check the full operations list at
+ *   https://ws.caexlogistics.com/wsCAEXLogisticsSB/wsCAEXLogisticsSB.asmx
+ *   for an address-validation/tokenization op that must run first.
+ * - `Piezas` (package weight/dims): this handler doesn't currently pass
+ *   real package data, so a single default piece is sent using
+ *   CAEX_DEFAULT_PIEZA and placeholder weight/dimensions. If CAEX needs
+ *   accurate weight for routing/pricing, `order-paid-handler.js` should
+ *   be extended to pass `piezas` built from `order.line_items[].grams`.
+ * - `DestinatarioNIT`: this handler has no NIT data (that lives in the
+ *   separate certification service per earlier findings), so 'CF' is
+ *   sent. Confirm with CAEX whether 'CF' is an acceptable placeholder
+ *   for guide generation specifically (separate from invoicing).
  */
 export async function generateGuide({
-  recoleccionId,
-  remitenteNombre,
-  remitenteDireccion,
-  remitenteTelefono,
+  orderId,
   customerName,
   phone,
   address1,
   address2,
-  nit,
-  reference,
-  referencia2,
   destPobladoCode,
-  origenPobladoCode,
-  servicio,
-  montoCOD,
-  formatoImpresion,
-  montoAsegurado,
-  observaciones,
-  codigoReferencia,
-  fechaRecoleccion,
-  tipoEntrega,
-  tokenDireccion,
+  reference,
+  amount,
   piezas,
 }) {
   const direccionCompleta = [address1, address2].filter(Boolean).join(', ');
+  const recoleccionId = String(reference || orderId || '');
 
   const piezasArray = Array.isArray(piezas) && piezas.length > 0 ? piezas : [{}];
   const piezasXml = piezasArray.map(piezaXml).join('\n        ');
 
   const datosRecoleccionXml = `<DatosRecoleccion>
         <RecoleccionID>${escapeXml(recoleccionId)}</RecoleccionID>
-        <RemitenteNombre>${escapeXml(remitenteNombre || process.env.CAEX_REMITENTE_NOMBRE)}</RemitenteNombre>
-        <RemitenteDireccion>${escapeXml(remitenteDireccion || process.env.CAEX_REMITENTE_DIRECCION)}</RemitenteDireccion>
-        <RemitenteTelefono>${escapeXml(remitenteTelefono || process.env.CAEX_REMITENTE_TELEFONO)}</RemitenteTelefono>
+        <RemitenteNombre>${escapeXml(process.env.CAEX_REMITENTE_NOMBRE)}</RemitenteNombre>
+        <RemitenteDireccion>${escapeXml(process.env.CAEX_REMITENTE_DIRECCION)}</RemitenteDireccion>
+        <RemitenteTelefono>${escapeXml(process.env.CAEX_REMITENTE_TELEFONO)}</RemitenteTelefono>
         <DestinatarioNombre>${escapeXml(customerName)}</DestinatarioNombre>
         <DestinatarioDireccion>${escapeXml(direccionCompleta)}</DestinatarioDireccion>
         <DestinatarioTelefono>${escapeXml(phone)}</DestinatarioTelefono>
         <DestinatarioContacto>${escapeXml(customerName)}</DestinatarioContacto>
-        <DestinatarioNIT>${escapeXml(nit || 'CF')}</DestinatarioNIT>
+        <DestinatarioNIT>CF</DestinatarioNIT>
         <ReferenciaCliente1>${escapeXml(reference)}</ReferenciaCliente1>
-        <ReferenciaCliente2>${escapeXml(referencia2 || '')}</ReferenciaCliente2>
+        <ReferenciaCliente2>${escapeXml(String(orderId || ''))}</ReferenciaCliente2>
         <CodigoPobladoDestino>${escapeXml(destPobladoCode)}</CodigoPobladoDestino>
-        <CodigoPobladoOrigen>${escapeXml(origenPobladoCode || process.env.CAEX_ORIGEN_POBLADO)}</CodigoPobladoOrigen>
-        <TipoServicio>${escapeXml(servicio || process.env.CAEX_DEFAULT_SERVICIO)}</TipoServicio>
-        <MontoCOD>${montoCOD ?? 0}</MontoCOD>
-        <FormatoImpresion>${escapeXml(formatoImpresion || process.env.CAEX_FORMATO_IMPRESION || 'PDF')}</FormatoImpresion>
+        <CodigoPobladoOrigen>${escapeXml(process.env.CAEX_ORIGEN_POBLADO)}</CodigoPobladoOrigen>
+        <TipoServicio>${escapeXml(process.env.CAEX_DEFAULT_SERVICIO)}</TipoServicio>
+        <MontoCOD>0</MontoCOD>
+        <FormatoImpresion>${escapeXml(process.env.CAEX_FORMATO_IMPRESION || 'PDF')}</FormatoImpresion>
         <CodigoCredito>${escapeXml(process.env.CAEX_CREDITO)}</CodigoCredito>
-        <MontoAsegurado>${montoAsegurado ?? 0}</MontoAsegurado>
-        <Observaciones>${escapeXml(observaciones || '')}</Observaciones>
-        <CodigoReferencia>${codigoReferencia ?? 0}</CodigoReferencia>
-        <FechaRecoleccion>${fechaRecoleccion || new Date().toISOString()}</FechaRecoleccion>
-        <TipoEntrega>${tipoEntrega ?? process.env.CAEX_DEFAULT_ENTREGA}</TipoEntrega>
-        <TokenDireccion>${escapeXml(tokenDireccion || '')}</TokenDireccion>
+        <MontoAsegurado>${parseFloat(amount) || 0}</MontoAsegurado>
+        <Observaciones></Observaciones>
+        <CodigoReferencia>0</CodigoReferencia>
+        <FechaRecoleccion>${new Date().toISOString()}</FechaRecoleccion>
+        <TipoEntrega>${escapeXml(process.env.CAEX_DEFAULT_ENTREGA)}</TipoEntrega>
+        <TokenDireccion></TokenDireccion>
         <Piezas>
         ${piezasXml}
         </Piezas>
@@ -236,6 +234,13 @@ export async function generateGuide({
     </GenerarGuia>`;
 
   const response = await soapCall('GenerarGuia', body);
+
+  // TEMP DIAGNOSTIC LOGGING — the field-name guesses below
+  // (ResultadoOperacionMultiple / ListaRecolecciones / NumeroGuia) were
+  // never confirmed against a real CAEX success response. Log the full
+  // raw response every time so we can see the ACTUAL field names CAEX
+  // uses and fix the parsing below for real. Remove this once confirmed.
+  log.info('CAEX GenerarGuia raw response', JSON.stringify(response));
 
   const result = response?.ResultadoGenerarGuia;
   const opResult = result?.ResultadoOperacionMultiple;

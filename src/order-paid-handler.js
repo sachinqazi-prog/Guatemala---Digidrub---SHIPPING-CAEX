@@ -166,6 +166,20 @@ async function processGuideGeneration(order, meta) {
       return;
     }
 
+    if (!guideResult.success) {
+      // CAEX responded but declined to create the guide (a business
+      // rule rejection, e.g. "same-day delivery not available for this
+      // town" — not a schema/auth error, so it doesn't throw). This was
+      // previously falling through and marking the order fulfilled with
+      // no real guide behind it. Stop here instead.
+      log.error('CAEX declined to generate guide', {
+        orderId,
+        error: guideResult.error,
+        code: guideResult.code,
+      });
+      return;
+    }
+
     const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
     const firstFulfillmentOrder = fulfillmentOrders[0];
 

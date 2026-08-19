@@ -146,6 +146,62 @@ function tomorrowAt9am() {
 }
 
 /**
+ * TEMPORARY DIAGNOSTIC — sends the exact same DatosRecoleccion as
+ * generateGuide(), except Piezas uses CAEX's own documented nil pattern
+ * (<Pieza xsi:nil="true" />) instead of our guessed field names
+ * (CodigoPieza/Peso/Alto/etc, which are NOT published anywhere in
+ * CAEX's docs — confirmed by fetching their own sample, which itself
+ * shows Pieza as nil). If this variant succeeds where the normal one
+ * fails, we've proven the guessed Pieza fields are the cause. If it
+ * still fails identically, Piezas isn't the problem and TokenDireccion
+ * or something else is. Remove once the real cause is confirmed.
+ */
+export async function generateGuideDebugNilPiezas(input) {
+  const guideInput = { ...input };
+  const direccionCompleta = [guideInput.address1, guideInput.address2].filter(Boolean).join(', ');
+  const recoleccionId = String(guideInput.reference || guideInput.orderId || '');
+
+  const body = `<GenerarGuia xmlns="${CAEX_NS}">
+      ${authXml()}
+      <ListaRecolecciones>
+        <DatosRecoleccion>
+          <RecoleccionID>${escapeXml(recoleccionId)}</RecoleccionID>
+          <RemitenteNombre>${escapeXml(process.env.CAEX_REMITENTE_NOMBRE)}</RemitenteNombre>
+          <RemitenteDireccion>${escapeXml(process.env.CAEX_REMITENTE_DIRECCION)}</RemitenteDireccion>
+          <RemitenteTelefono>${escapeXml(process.env.CAEX_REMITENTE_TELEFONO)}</RemitenteTelefono>
+          <DestinatarioNombre>${escapeXml(guideInput.customerName)}</DestinatarioNombre>
+          <DestinatarioDireccion>${escapeXml(direccionCompleta)}</DestinatarioDireccion>
+          <DestinatarioTelefono>${escapeXml(guideInput.phone)}</DestinatarioTelefono>
+          <DestinatarioContacto>${escapeXml(guideInput.customerName)}</DestinatarioContacto>
+          <DestinatarioNIT>CF</DestinatarioNIT>
+          <ReferenciaCliente1>${escapeXml(guideInput.reference)}</ReferenciaCliente1>
+          <ReferenciaCliente2>${escapeXml(String(guideInput.orderId || ''))}</ReferenciaCliente2>
+          <CodigoPobladoDestino>${escapeXml(guideInput.destPobladoCode)}</CodigoPobladoDestino>
+          <CodigoPobladoOrigen>${escapeXml(process.env.CAEX_ORIGEN_POBLADO)}</CodigoPobladoOrigen>
+          <TipoServicio>${escapeXml(process.env.CAEX_DEFAULT_SERVICIO)}</TipoServicio>
+          <MontoCOD>0</MontoCOD>
+          <FormatoImpresion>${escapeXml(process.env.CAEX_FORMATO_IMPRESION || 'PDF')}</FormatoImpresion>
+          <CodigoCredito>${escapeXml(process.env.CAEX_CREDITO)}</CodigoCredito>
+          <MontoAsegurado>${parseFloat(guideInput.amount) || 0}</MontoAsegurado>
+          <Observaciones></Observaciones>
+          <CodigoReferencia>0</CodigoReferencia>
+          <FechaRecoleccion>${tomorrowAt9am()}</FechaRecoleccion>
+          <TipoEntrega>${escapeXml(process.env.CAEX_DEFAULT_ENTREGA)}</TipoEntrega>
+          <TokenDireccion></TokenDireccion>
+          <Piezas>
+            <Pieza xsi:nil="true" />
+          </Piezas>
+        </DatosRecoleccion>
+      </ListaRecolecciones>
+    </GenerarGuia>`;
+
+  log.info('CAEX GenerarGuia DEBUG (nil Piezas) outgoing request', body);
+  const response = await soapCall('GenerarGuia', body);
+  log.info('CAEX GenerarGuia DEBUG (nil Piezas) response', JSON.stringify(response));
+  return response;
+}
+
+/**
  * Build a single <Pieza> node for the Piezas list.
  * CAEX doesn't publish the internal Pieza schema in the public op docs
  * (it shows as xsi:nil in the sample). Field names below are a best
@@ -248,6 +304,16 @@ export async function generateGuide({
         ${datosRecoleccionXml}
       </ListaRecolecciones>
     </GenerarGuia>`;
+
+  // TEMP DIAGNOSTIC LOGGING — logging the exact outgoing XML so we have
+  // a full request/response pair to send to CAEX support. The
+  // "same-day delivery" error has persisted across every combination
+  // of origin, destination, service type, and pickup date we've tried,
+  // which suggests the message may be a generic catch-all rather than
+  // literally about timing — most likely candidates left are the
+  // Piezas block or TokenDireccion, both unconfirmed against any real
+  // CAEX example. Remove this once CAEX support has confirmed the fix.
+  log.info('CAEX GenerarGuia outgoing request', body);
 
   const response = await soapCall('GenerarGuia', body);
 

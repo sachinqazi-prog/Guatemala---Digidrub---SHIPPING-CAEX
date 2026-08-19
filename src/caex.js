@@ -130,6 +130,22 @@ export async function getPoblados(codigoDepartamento) {
 }
 
 /**
+ * Returns tomorrow's date as an ISO string, at a reasonable business
+ * hour (9am). CAEX was rejecting requests with FechaRecoleccion set to
+ * the current moment with "Poblados no se puede entregar en el mismo
+ * dia" (can't deliver same-day) — happened consistently across
+ * different towns and different TipoEntrega values, so the pickup DATE
+ * itself (today) was the trigger, not the service type. Defaulting to
+ * tomorrow avoids asking CAEX for same-day service at all.
+ */
+function tomorrowAt9am() {
+  const d = new Date();
+  d.setDate(d.getDate() + 1);
+  d.setHours(9, 0, 0, 0);
+  return d.toISOString();
+}
+
+/**
  * Build a single <Pieza> node for the Piezas list.
  * CAEX doesn't publish the internal Pieza schema in the public op docs
  * (it shows as xsi:nil in the sample). Field names below are a best
@@ -218,7 +234,7 @@ export async function generateGuide({
         <MontoAsegurado>${parseFloat(amount) || 0}</MontoAsegurado>
         <Observaciones></Observaciones>
         <CodigoReferencia>0</CodigoReferencia>
-        <FechaRecoleccion>${new Date().toISOString()}</FechaRecoleccion>
+        <FechaRecoleccion>${tomorrowAt9am()}</FechaRecoleccion>
         <TipoEntrega>${escapeXml(process.env.CAEX_DEFAULT_ENTREGA)}</TipoEntrega>
         <TokenDireccion></TokenDireccion>
         <Piezas>

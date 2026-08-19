@@ -235,13 +235,6 @@ export async function generateGuide({
 
   const response = await soapCall('GenerarGuia', body);
 
-  // TEMP DIAGNOSTIC LOGGING — the field-name guesses below
-  // (ResultadoOperacionMultiple / ListaRecolecciones / NumeroGuia) were
-  // never confirmed against a real CAEX success response. Log the full
-  // raw response every time so we can see the ACTUAL field names CAEX
-  // uses and fix the parsing below for real. Remove this once confirmed.
-  log.info('CAEX GenerarGuia raw response', JSON.stringify(response));
-
   const result = response?.ResultadoGenerarGuia;
   const opResult = result?.ResultadoOperacionMultiple;
 

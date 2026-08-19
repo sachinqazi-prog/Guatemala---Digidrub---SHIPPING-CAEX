@@ -3,7 +3,7 @@ import express from 'express';
 import { handleRatesRequest } from './rates-handler.js';
 import { handleOrderPaid } from './order-paid-handler.js';
 import { loadPoblados } from './poblado-lookup.js';
-import { getDepartamentos, getPoblados } from './caex.js';
+import { getDepartamentos, getPoblados, generateGuideDebugNilPiezas } from './caex.js';
 import { log } from './logger.js';
 const app = express();
 // Raw body only for Shopify webhooks
@@ -43,6 +43,24 @@ app.get('/debug/poblados/:deptCode', async (req, res) => {
   try {
     const poblados = await getPoblados(req.params.deptCode);
     res.json(poblados);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+app.get('/debug/test-nil-piezas', async (req, res) => {
+  // Hardcoded, safe, harmless test data — not tied to a real order.
+  try {
+    const response = await generateGuideDebugNilPiezas({
+      orderId: 'DEBUG-TEST',
+      reference: 'DEBUG-TEST',
+      customerName: 'Test Cliente',
+      phone: '55512345',
+      address1: 'Calle Falsa 123',
+      address2: '',
+      destPobladoCode: process.env.CAEX_ORIGEN_POBLADO, // same as origin, guaranteed valid
+      amount: '100',
+    });
+    res.json(response);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

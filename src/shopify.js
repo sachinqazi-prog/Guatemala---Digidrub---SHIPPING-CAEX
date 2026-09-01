@@ -17,14 +17,31 @@ export async function getOrder(orderId) {
   const { data } = await client.get(`/orders/${orderId}.json`);
   return data.order;
 }
+/**
+ * Creates a Shopify fulfillment with tracking info. Accepts one or more
+ * tracking numbers/URLs — since CAEX's GenerarGuia is now called once
+ * PER LINE ITEM (per CAEX's own spec), a single order can produce
+ * several tracking numbers, one per product. Uses Shopify's plural
+ * tracking_info.numbers/urls fields when there's more than one;
+ * falls back to the singular number/url fields for the common
+ * single-item case (known to work from earlier testing).
+ */
 export async function createFulfillmentWithTracking({
   orderId,
   fulfillmentOrderId,
-  trackingNumber,
+  trackingNumbers,
+  trackingUrls,
   trackingCompany = 'CAEX',
-  trackingUrl,
 }) {
   const client = adminClient();
+  const numbers = Array.isArray(trackingNumbers) ? trackingNumbers : [trackingNumbers].filter(Boolean);
+  const urls = Array.isArray(trackingUrls) ? trackingUrls : [trackingUrls].filter(Boolean);
+
+  const trackingInfo =
+    numbers.length > 1
+      ? { numbers, urls, company: trackingCompany }
+      : { number: numbers[0], url: urls[0], company: trackingCompany };
+
   const body = {
     fulfillment: {
       line_items_by_fulfillment_order: [
@@ -32,11 +49,7 @@ export async function createFulfillmentWithTracking({
           fulfillment_order_id: fulfillmentOrderId,
         },
       ],
-      tracking_info: {
-        number: trackingNumber,
-        company: trackingCompany,
-        url: trackingUrl,
-      },
+      tracking_info: trackingInfo,
       notify_customer: false,
     },
   };

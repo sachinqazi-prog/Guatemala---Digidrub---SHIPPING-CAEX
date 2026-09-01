@@ -45,37 +45,58 @@ function noteAttributesMap(order) {
   return map;
 }
 
-function buildGuidePayload(order) {
+/**
+ * Builds ONE generateGuide() payload per shippable line item on the
+ * order — per CAEX's own spec, GenerarGuia must be called once per
+ * invoiced product, not once per order.
+ *
+ * Field sourcing, matched against CAEX's official "Explanation of the
+ * GenerarGuia method" document:
+ *
+ * CONFIRMED / correct:
+ * - RecoleccionID = "{orderNumber}-{productNumber}"
+ * - DestinatarioNombre, DestinatarioDireccion (street only), Telefono
+ * - DestinatarioContacto = same value as RecoleccionID
+ * - ReferenciaCliente1 = "{sku} - {productName}"
+ * - CodigoPobladoDestino = precise CAEX poblado from order note attrs
+ *
+ * STILL UNCONFIRMED — using a reasonable fallback, flagged clearly:
+ * - DestinatarioNIT: spec says this must be the real customer NIT from
+ *   the "Datos para Factura Electrónica (FEL)" window. We've seen a
+ *   "NIT" note attribute on real orders (e.g. order #1102's Additional
+ *   Details showed NIT: 2241839151202). Using notes['NIT'] here, with
+ *   'CF' as fallback if absent — CONFIRM this note attribute key name
+ *   is right; if guides still fail on NIT, check the exact key.
+ * - ReferenciaCliente2 (Invoice UUID): spec says this must be the FEL
+ *   invoice UUID, which lives in the SEPARATE certification/invoicing
+ *   service, not this shipping middleware. No confirmed way to fetch
+ *   it here yet — sending empty string as a placeholder. This should
+ *   be revisited: either that service needs to write the UUID onto the
+ *   order (e.g. as a note attribute, similar to NIT/_caex_poblado_id),
+ *   or this handler needs to call that service's API directly.
+ * - Cantidad_de_piezas / weight ("Ashley Direct"): spec says piece
+ *   count comes from a Products API and weight from "Ashley Direct" —
+ *   neither is integrated here. Falling back to 1 piece, weight from
+ *   Shopify's own line_item.grams (converted to kg). Revisit once the
+ *   real Products API / Ashley Direct integration is available.
+ */
+function buildLineItemGuidePayloads(order) {
   const shippingAddress = order?.shipping_address || {};
   const notes = noteAttributesMap(order);
 
-  // Prefer the precise CAEX poblado code when the checkout already
-  // captured one (seen on real orders as _caex_poblado_id /
-  // _caex_departamento_id note attributes — some part of checkout,
-  // possibly the "Product Sync Guatemala" app, resolves this exactly).
-  // Fall back to fuzzy city-name matching only when those aren't
-  // present. This matters because the fuzzy fallback was found to
-  // silently default to "the first poblado in the department" on any
-  // miss, which was causing CAEX to reject guides with a same-day
-  // delivery error — it wasn't a same-day problem, it was routing to
-  // the wrong destination entirely.
   const preciseDeptCode = notes['_caex_departamento_id'];
   const precisePobladoCode = notes['_caex_poblado_id'];
 
-  let deptCode;
   let destPobladoCode;
-
   if (preciseDeptCode && precisePobladoCode) {
-    deptCode = preciseDeptCode;
     destPobladoCode = precisePobladoCode;
     log.info('Using precise CAEX poblado from order note attributes', {
       orderId: order.id,
-      deptCode,
       destPobladoCode,
       pobladoName: notes['_caex_poblado_name'],
     });
   } else {
-    deptCode = resolveDepartamento({
+    const deptCode = resolveDepartamento({
       province: shippingAddress?.province,
       province_code: shippingAddress?.province_code,
     });
@@ -88,25 +109,49 @@ function buildGuidePayload(order) {
     });
   }
 
-  return {
-    orderId: order.id,
-    codigoDespacho: 8,
-    customerName:
-      `${shippingAddress?.first_name || ''} ${shippingAddress?.last_name || ''}`.trim() ||
-      order?.customer?.first_name ||
-      order?.email ||
-      'Cliente Shopify',
-    phone: shippingAddress?.phone || order?.phone || '',
-    email: order?.email || '',
-    address1: shippingAddress?.address1 || '',
-    address2: shippingAddress?.address2 || '',
-    city: shippingAddress?.city || '',
-    province: shippingAddress?.province || '',
-    deptCode,
-    destPobladoCode,
-    reference: order?.name || String(order?.id),
-    amount: order?.total_price || '0',
-  };
+  const customerName =
+    `${shippingAddress?.first_name || ''} ${shippingAddress?.last_name || ''}`.trim() ||
+    order?.customer?.first_name ||
+    order?.email ||
+    'Cliente Shopify';
+  const phone = shippingAddress?.phone || order?.phone || '';
+  const address1 = shippingAddress?.address1 || '';
+
+  const nit = notes['NIT'];
+  if (!nit) {
+    log.warn('No NIT note attribute found on order — sending CF', { orderId: order.id });
+  }
+
+  const invoiceUuid = notes['Invoice UUID'] || notes['_invoice_uuid'] || '';
+  if (!invoiceUuid) {
+    log.warn('No invoice UUID available for order — CAEX ReferenciaCliente2 will be blank. This needs to come from the certification/invoicing service.', {
+      orderId: order.id,
+    });
+  }
+
+  const orderNumber = order?.order_number || String(order?.name || order?.id).replace('#', '');
+
+  const shippableItems = (order?.line_items || []).filter((li) => li?.requires_shipping);
+
+  return shippableItems.map((item, index) => {
+    const productNumber = String(index + 1).padStart(2, '0');
+    const pesoTotalKg = item?.grams ? item.grams / 1000 : 1;
+
+    return {
+      orderNumber,
+      productNumber,
+      customerName,
+      address1,
+      phone,
+      nit,
+      sku: item?.sku || '',
+      productName: item?.name || item?.title || '',
+      invoiceUuid,
+      destPobladoCode,
+      cantidadPiezas: 1, // TODO: source from Products API's Cantidad_de_piezas once available
+      pesoTotalKg,
+    };
+  });
 }
 
 /**
@@ -206,37 +251,62 @@ async function processGuideGeneration(order, meta) {
       return;
     }
 
-    const guideInput = buildGuidePayload(order);
-
-    let guideResult;
-    try {
-      guideResult = await generateGuide(guideInput);
-    } catch (err) {
-      log.error('generateGuide failed', { orderId, ...describeAxiosError(err) });
+    const lineItemPayloads = buildLineItemGuidePayloads(order);
+    if (lineItemPayloads.length === 0) {
+      log.warn('No shippable line items found on order — nothing to generate', { orderId });
       return;
     }
 
-    if (!guideResult.success) {
-      // CAEX responded but declined to create the guide (a business
-      // rule rejection, e.g. "same-day delivery not available for this
-      // town" — not a schema/auth error, so it doesn't throw). This was
-      // previously falling through and marking the order fulfilled with
-      // no real guide behind it. Stop here instead.
-      log.error('CAEX declined to generate guide', {
-        orderId,
-        error: guideResult.error,
-        code: guideResult.code,
-      });
+    // Call generateGuide once PER LINE ITEM, sequentially (not
+    // parallel) — safer against CAEX's SOAP service, and easier to
+    // read in logs when debugging.
+    const results = [];
+    for (const payload of lineItemPayloads) {
+      let result;
+      try {
+        result = await generateGuide(payload);
+      } catch (err) {
+        log.error('generateGuide failed for line item', {
+          orderId,
+          recoleccionId: `${payload.orderNumber}-${payload.productNumber}`,
+          ...describeAxiosError(err),
+        });
+        continue;
+      }
+
+      if (!result.success) {
+        log.error('CAEX declined to generate guide for line item', {
+          orderId,
+          recoleccionId: `${payload.orderNumber}-${payload.productNumber}`,
+          error: result.error,
+          code: result.code,
+        });
+        continue;
+      }
+
+      results.push(result);
+    }
+
+    if (results.length === 0) {
+      log.error('No guides were successfully generated for this order', { orderId });
       return;
+    }
+
+    if (results.length < lineItemPayloads.length) {
+      log.warn('Some line items failed to get a CAEX guide — order partially fulfilled', {
+        orderId,
+        succeeded: results.length,
+        total: lineItemPayloads.length,
+      });
     }
 
     const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
     const firstFulfillmentOrder = fulfillmentOrders[0];
 
     if (!firstFulfillmentOrder) {
-      log.warn('Guide created but no fulfillment order found after retries', {
+      log.warn('Guide(s) created but no fulfillment order found after retries', {
         orderId,
-        trackingNumber: guideResult.trackingNumber,
+        trackingNumbers: results.map((r) => r.trackingNumber),
       });
       return;
     }
@@ -245,17 +315,17 @@ async function processGuideGeneration(order, meta) {
       await createFulfillmentWithTracking({
         orderId,
         fulfillmentOrderId: firstFulfillmentOrder.id,
-        trackingNumber: guideResult.trackingNumber,
-        trackingUrl: guideResult.trackingUrl,
+        trackingNumbers: results.map((r) => r.trackingNumber).filter(Boolean),
+        trackingUrls: results.map((r) => r.trackingUrl).filter(Boolean),
       });
     } catch (err) {
       log.error('createFulfillmentWithTracking failed', { orderId, ...describeAxiosError(err) });
       return;
     }
 
-    log.info('Guide created and fulfillment updated', {
+    log.info('Guide(s) created and fulfillment updated', {
       orderId,
-      trackingNumber: guideResult.trackingNumber,
+      trackingNumbers: results.map((r) => r.trackingNumber),
     });
   } finally {
     processingOrders.delete(orderId);

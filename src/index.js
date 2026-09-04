@@ -3,6 +3,7 @@ import express from 'express';
 import { handleRatesRequest } from './rates-handler.js';
 import { handleOrderPaid } from './order-paid-handler.js';
 import { loadPoblados } from './poblado-lookup.js';
+import { getOrder, getOrderMetafields } from './shopify.js';
 import { log } from './logger.js';
 const app = express();
 // Raw body only for Shopify webhooks
@@ -26,6 +27,24 @@ app.get('/health', (_req, res) => {
 app.post('/shopify/rates', handleRatesRequest);
 app.post('/test/rates', handleRatesRequest);
 app.post('/shopify/order-paid', handleOrderPaid);
+
+// TEMPORARY DEBUG ROUTE — used to find where the invoice UUID (written
+// by the separate certification/invoicing service) actually lives on
+// the order. No auth, so REMOVE once the real field is confirmed.
+app.get('/debug/order/:orderId', async (req, res) => {
+  try {
+    const order = await getOrder(req.params.orderId);
+    const metafields = await getOrderMetafields(req.params.orderId).catch((err) => ({
+      error: err.message,
+    }));
+    res.json({
+      note_attributes: order?.note_attributes || [],
+      metafields,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/', (_req, res) => {
   res.json({

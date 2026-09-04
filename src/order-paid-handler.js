@@ -122,10 +122,11 @@ function buildLineItemGuidePayloads(order) {
     log.warn('No NIT note attribute found on order — sending CF', { orderId: order.id });
   }
 
-  const invoiceUuid = notes['Invoice UUID'] || notes['_invoice_uuid'] || '';
+  const invoiceUuid = notes['Invoice UUID'] || notes['_invoice_uuid'] || notes['invoice_uuid'] || '';
   if (!invoiceUuid) {
-    log.warn('No invoice UUID available for order — CAEX ReferenciaCliente2 will be blank. This needs to come from the certification/invoicing service.', {
+    log.warn('No invoice UUID available for order — CAEX ReferenciaCliente2 will be blank. All note attributes on this order:', {
       orderId: order.id,
+      noteAttributes: notes,
     });
   }
 
@@ -138,6 +139,8 @@ function buildLineItemGuidePayloads(order) {
     const pesoTotalKg = item?.grams ? item.grams / 1000 : 1;
 
     return {
+      lineItemId: item.id, // needed to scope the Shopify fulfillment to just this product
+      quantity: item.quantity,
       orderNumber,
       productNumber,
       customerName,
@@ -251,7 +254,27 @@ async function processGuideGeneration(order, meta) {
       return;
     }
 
-    const lineItemPayloads = buildLineItemGuidePayloads(order);
+    // The invoicing/certification service runs on the SAME trigger
+    // (order placement) and writes the invoice UUID back onto the order
+    // shortly after — but it's not guaranteed to have finished by the
+    // time our webhook fires, since it involves its own network round
+    // trip. Re-fetch the order a few times, giving it a chance to catch
+    // up, before building the guide payloads. We're already running in
+    // the background after acking Shopify, so this delay is safe.
+    let freshOrder = order;
+    for (let i = 0; i < 3; i++) {
+      const notes = noteAttributesMap(freshOrder);
+      const hasUuid = notes['Invoice UUID'] || notes['_invoice_uuid'] || notes['invoice_uuid'];
+      if (hasUuid) break;
+      log.info('Invoice UUID not yet on order — waiting for invoicing service, retrying', {
+        orderId,
+        attempt: i + 1,
+      });
+      await sleep(3000);
+      freshOrder = await getOrder(orderId);
+    }
+
+    const lineItemPayloads = buildLineItemGuidePayloads(freshOrder);
     if (lineItemPayloads.length === 0) {
       log.warn('No shippable line items found on order — nothing to generate', { orderId });
       return;
@@ -259,8 +282,10 @@ async function processGuideGeneration(order, meta) {
 
     // Call generateGuide once PER LINE ITEM, sequentially (not
     // parallel) — safer against CAEX's SOAP service, and easier to
-    // read in logs when debugging.
-    const results = [];
+    // read in logs when debugging. Keep each result paired with the
+    // payload that produced it, so we can match it back to the right
+    // Shopify line item afterward.
+    const successes = [];
     for (const payload of lineItemPayloads) {
       let result;
       try {
@@ -284,48 +309,90 @@ async function processGuideGeneration(order, meta) {
         continue;
       }
 
-      results.push(result);
+      successes.push({ payload, result });
     }
 
-    if (results.length === 0) {
+    if (successes.length === 0) {
       log.error('No guides were successfully generated for this order', { orderId });
       return;
     }
 
-    if (results.length < lineItemPayloads.length) {
+    if (successes.length < lineItemPayloads.length) {
       log.warn('Some line items failed to get a CAEX guide — order partially fulfilled', {
         orderId,
-        succeeded: results.length,
+        succeeded: successes.length,
         total: lineItemPayloads.length,
       });
     }
 
     const fulfillmentOrders = await getFulfillmentOrdersWithRetry(orderId);
-    const firstFulfillmentOrder = fulfillmentOrders[0];
-
-    if (!firstFulfillmentOrder) {
+    if (fulfillmentOrders.length === 0) {
       log.warn('Guide(s) created but no fulfillment order found after retries', {
         orderId,
-        trackingNumbers: results.map((r) => r.trackingNumber),
+        trackingNumbers: successes.map((s) => s.result.trackingNumber),
       });
       return;
     }
 
-    try {
-      await createFulfillmentWithTracking({
-        orderId,
-        fulfillmentOrderId: firstFulfillmentOrder.id,
-        trackingNumbers: results.map((r) => r.trackingNumber).filter(Boolean),
-        trackingUrls: results.map((r) => r.trackingUrl).filter(Boolean),
-      });
-    } catch (err) {
-      log.error('createFulfillmentWithTracking failed', { orderId, ...describeAxiosError(err) });
-      return;
+    // Build a lookup from Shopify's original line_item.id to the
+    // matching fulfillment-order line item (id + fulfillable quantity).
+    // A fulfillment order's line items carry `line_item_id`, which
+    // points back to the order's own line item — that's the join key.
+    const focLineItemByOrderLineItemId = new Map();
+    for (const fo of fulfillmentOrders) {
+      for (const li of fo?.line_items || []) {
+        focLineItemByOrderLineItemId.set(String(li.line_item_id), {
+          fulfillmentOrderId: fo.id,
+          focLineItemId: li.id,
+          quantity: li.fulfillable_quantity ?? li.quantity,
+        });
+      }
     }
 
-    log.info('Guide(s) created and fulfillment updated', {
+    // One Shopify fulfillment PER successful CAEX guide, each scoped to
+    // just that product, each with its own single tracking number.
+    // This matches how Shopify actually displays multiple trackings on
+    // one order (one fulfillment card per shipment) — trying to cram
+    // several tracking numbers into one fulfillment via plural fields
+    // isn't supported by this API and was silently producing no
+    // tracking info at all on multi-item orders.
+    const fulfilled = [];
+    const unmatched = [];
+    for (const { payload, result } of successes) {
+      const match = focLineItemByOrderLineItemId.get(String(payload.lineItemId));
+      if (!match) {
+        log.warn('No matching fulfillment-order line item found for CAEX guide — skipping', {
+          orderId,
+          lineItemId: payload.lineItemId,
+          trackingNumber: result.trackingNumber,
+        });
+        unmatched.push(result.trackingNumber);
+        continue;
+      }
+
+      try {
+        await createFulfillmentWithTracking({
+          orderId,
+          fulfillmentOrderId: match.fulfillmentOrderId,
+          fulfillmentOrderLineItems: [{ id: match.focLineItemId, quantity: match.quantity }],
+          trackingNumber: result.trackingNumber,
+          trackingUrl: result.trackingUrl,
+        });
+        fulfilled.push(result.trackingNumber);
+      } catch (err) {
+        log.error('createFulfillmentWithTracking failed for line item', {
+          orderId,
+          lineItemId: payload.lineItemId,
+          trackingNumber: result.trackingNumber,
+          ...describeAxiosError(err),
+        });
+      }
+    }
+
+    log.info('Guide(s) created and fulfillment(s) updated', {
       orderId,
-      trackingNumbers: results.map((r) => r.trackingNumber),
+      fulfilled,
+      unmatched,
     });
   } finally {
     processingOrders.delete(orderId);

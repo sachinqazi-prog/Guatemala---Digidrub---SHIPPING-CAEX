@@ -18,38 +18,49 @@ export async function getOrder(orderId) {
   return data.order;
 }
 /**
- * Creates a Shopify fulfillment with tracking info. Accepts one or more
- * tracking numbers/URLs — since CAEX's GenerarGuia is now called once
- * PER LINE ITEM (per CAEX's own spec), a single order can produce
- * several tracking numbers, one per product. Uses Shopify's plural
- * tracking_info.numbers/urls fields when there's more than one;
- * falls back to the singular number/url fields for the common
- * single-item case (known to work from earlier testing).
+ * Creates a Shopify fulfillment with tracking info, scoped to specific
+ * line item(s) within a fulfillment order.
+ *
+ * Since CAEX's GenerarGuia is called once PER LINE ITEM (per CAEX's own
+ * spec), a multi-item order produces multiple separate tracking
+ * numbers — one per product. Shopify's fulfillment-order-based API
+ * only supports a single tracking_info.number/url per fulfillment call
+ * (the plural tracking_info.numbers/urls fields used in an earlier
+ * version of this function were never actually confirmed to work on
+ * this API and were silently producing fulfillments with no tracking
+ * info at all on multi-item orders). The correct approach is one
+ * fulfillment call PER line item, each scoped via
+ * fulfillmentOrderLineItems so Shopify shows a separate fulfillment
+ * card with its own tracking number per product.
+ *
+ * Pass `fulfillmentOrderLineItems` (array of { id, quantity }, using
+ * the FULFILLMENT ORDER's line item id, not the order's line item id)
+ * to scope to specific products. Omit it to fulfill the whole
+ * fulfillment order at once (single-item orders, or if scoping isn't
+ * needed).
  */
 export async function createFulfillmentWithTracking({
   orderId,
   fulfillmentOrderId,
-  trackingNumbers,
-  trackingUrls,
+  fulfillmentOrderLineItems,
+  trackingNumber,
+  trackingUrl,
   trackingCompany = 'CAEX',
 }) {
   const client = adminClient();
-  const numbers = Array.isArray(trackingNumbers) ? trackingNumbers : [trackingNumbers].filter(Boolean);
-  const urls = Array.isArray(trackingUrls) ? trackingUrls : [trackingUrls].filter(Boolean);
 
-  const trackingInfo =
-    numbers.length > 1
-      ? { numbers, urls, company: trackingCompany }
-      : { number: numbers[0], url: urls[0], company: trackingCompany };
+  const lineItemsByFulfillmentOrder = fulfillmentOrderLineItems
+    ? { fulfillment_order_id: fulfillmentOrderId, fulfillment_order_line_items: fulfillmentOrderLineItems }
+    : { fulfillment_order_id: fulfillmentOrderId };
 
   const body = {
     fulfillment: {
-      line_items_by_fulfillment_order: [
-        {
-          fulfillment_order_id: fulfillmentOrderId,
-        },
-      ],
-      tracking_info: trackingInfo,
+      line_items_by_fulfillment_order: [lineItemsByFulfillmentOrder],
+      tracking_info: {
+        number: trackingNumber,
+        url: trackingUrl,
+        company: trackingCompany,
+      },
       notify_customer: false,
     },
   };
@@ -82,4 +93,17 @@ export async function getFulfillments(orderId) {
   const client = adminClient();
   const { data } = await client.get(`/orders/${orderId}/fulfillments.json`);
   return data.fulfillments || [];
+}
+
+/**
+ * NEW — returns an order's metafields. The invoice UUID from the
+ * separate certification service might live here instead of in
+ * note_attributes (note_attributes are usually set at checkout time;
+ * a metafield is more typical for something written back by a
+ * different service after the order already exists).
+ */
+export async function getOrderMetafields(orderId) {
+  const client = adminClient();
+  const { data } = await client.get(`/orders/${orderId}/metafields.json`);
+  return data.metafields || [];
 }

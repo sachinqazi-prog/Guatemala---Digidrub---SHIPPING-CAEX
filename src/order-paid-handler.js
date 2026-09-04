@@ -258,19 +258,28 @@ async function processGuideGeneration(order, meta) {
     // (order placement) and writes the invoice UUID back onto the order
     // shortly after — but it's not guaranteed to have finished by the
     // time our webhook fires, since it involves its own network round
-    // trip. Re-fetch the order a few times, giving it a chance to catch
-    // up, before building the guide payloads. We're already running in
-    // the background after acking Shopify, so this delay is safe.
+    // trip (fetch transactions, ConsultaNIT, certify, write back). Re-
+    // fetch the order a few times, giving it a chance to catch up,
+    // before building the guide payloads. We're already running in the
+    // background after acking Shopify, so this delay is safe.
+    //
+    // Confirmed on order #1138: the UUID existed on the order but
+    // arrived AFTER our old ~9s window (3 attempts x 3s) gave up,
+    // leaving ReferenciaCliente2 blank on an otherwise-successful
+    // guide. Widened to ~40s (7 attempts x ~5.7s) to cover that gap.
     let freshOrder = order;
-    for (let i = 0; i < 3; i++) {
+    const uuidRetryAttempts = 7;
+    const uuidRetryDelayMs = 5700;
+    for (let i = 0; i < uuidRetryAttempts; i++) {
       const notes = noteAttributesMap(freshOrder);
       const hasUuid = notes['Invoice UUID'] || notes['_invoice_uuid'] || notes['invoice_uuid'];
       if (hasUuid) break;
       log.info('Invoice UUID not yet on order — waiting for invoicing service, retrying', {
         orderId,
         attempt: i + 1,
+        attempts: uuidRetryAttempts,
       });
-      await sleep(3000);
+      await sleep(uuidRetryDelayMs);
       freshOrder = await getOrder(orderId);
     }
 

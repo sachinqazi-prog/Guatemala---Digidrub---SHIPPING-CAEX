@@ -151,7 +151,7 @@ function buildLineItemGuidePayloads(order) {
       productName: item?.name || item?.title || '',
       invoiceUuid,
       destPobladoCode,
-      cantidadPiezas: 1, // TODO: source from Products API's Cantidad_de_piezas once available
+      cantidadPiezas: item.quantity || 1, // uses the real ordered quantity — TODO: replace with Products API's actual Cantidad_de_piezas once available, in case a single unit legitimately ships as multiple physical pieces
       pesoTotalKg,
     };
   });

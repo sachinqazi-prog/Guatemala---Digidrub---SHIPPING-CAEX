@@ -186,7 +186,7 @@ export async function createFulfillmentWithTracking({
   };
 
   const query = `
-    mutation fulfillmentCreate($fulfillment: FulfillmentInput!) {
+    mutation fulfillmentCreate($fulfillment: FulfillmentV2Input!) {
       fulfillmentCreateV2(fulfillment: $fulfillment) {
         fulfillment {
           id

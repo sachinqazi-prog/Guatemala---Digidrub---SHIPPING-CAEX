@@ -162,7 +162,9 @@ async function buildLineItemGuidePayloads(order) {
       // guide generation entirely.
       const realPiecesPerUnit = await getCantidadDePiezas(item?.sku);
       let cantidadPiezas;
+      let piecesPerUnit;
       if (realPiecesPerUnit) {
+        piecesPerUnit = realPiecesPerUnit;
         cantidadPiezas = realPiecesPerUnit * (item.quantity || 1);
         log.info('Using real Cantidad_de_piezas from Products API', {
           orderId: order.id,
@@ -172,6 +174,12 @@ async function buildLineItemGuidePayloads(order) {
           totalPieces: cantidadPiezas,
         });
       } else {
+        // Unknown sub-boxing — treat each ordered unit as ONE piece
+        // (piecesPerUnit=1), so weight is never divided just because
+        // more than one unit was ordered. cantidadPiezas still equals
+        // quantity here (one <Pieza> entry per unit), but each entry
+        // gets the FULL per-unit weight, not a fraction of it.
+        piecesPerUnit = 1;
         cantidadPiezas = item.quantity || 1;
         log.warn('No real Cantidad_de_piezas available — falling back to ordered quantity alone', {
           orderId: order.id,
@@ -194,6 +202,7 @@ async function buildLineItemGuidePayloads(order) {
         invoiceUuid,
         destPobladoCode,
         cantidadPiezas,
+        piecesPerUnit,
         pesoTotalKg,
       };
     })

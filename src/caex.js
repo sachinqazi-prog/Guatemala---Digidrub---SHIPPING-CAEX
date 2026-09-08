@@ -160,11 +160,13 @@ export async function generateGuide({
   productName,       // for Point 6
   invoiceUuid,       // Point 7: the FEL invoice UUID
   destPobladoCode,   // Point 8: CAEX poblado code for the destination
-  cantidadPiezas,    // n — number of pieces for this product (from Cantidad_de_piezas)
-  pesoTotalKg,       // total weight for this product; gets divided by n per CAEX's spec
+  cantidadPiezas,    // n — TOTAL <Pieza> entries for this line item (piecesPerUnit × quantity)
+  piecesPerUnit,     // how many physical boxes ONE UNIT ships as — used ONLY to divide weight, never affected by quantity
+  pesoTotalKg,       // weight of ONE UNIT (from Shopify's per-unit grams field, NOT multiplied by quantity)
 }) {
   const recoleccionId = `${orderNumber}-${productNumber}`;
   const n = Math.max(1, Number(cantidadPiezas) || 1);
+
   // CAEX's GenerarGuia field is PesoPieza, and the printed labels
   // confirm it's treated as LBS with no conversion of its own — a
   // real order (#1146) sent 71.21 (meant as kg, from Shopify's grams
@@ -176,7 +178,23 @@ export async function generateGuide({
   // silently shows the wrong unit.
   const KG_TO_LBS = 2.20462;
   const pesoTotalLbs = (Number(pesoTotalKg) || 0) * KG_TO_LBS;
-  const pesoPorPieza = pesoTotalLbs / n; // 0 stays 0 — no fake fallback
+
+  // IMPORTANT: weight divides by piecesPerUnit (how many boxes ONE
+  // UNIT physically ships as), NOT by n (which also folds in the
+  // quantity multiplier). pesoTotalKg is already the weight of a
+  // SINGLE unit — it was never multiplied by quantity — so dividing
+  // it by n would halve (or worse) the real per-piece weight anytime
+  // quantity > 1. Real case caught on order #1152: two identical
+  // 159lb dining sets (quantity=2, no known sub-boxing so
+  // piecesPerUnit defaults to 1, n=2 via the quantity fallback) were
+  // each labeled 79.50 lbs instead of their real 159.00 lbs each —
+  // one unit's weight was being split BETWEEN the two separate units
+  // instead of each unit keeping its own full weight. Pieces within
+  // the SAME unit's sub-boxing split that one unit's weight; every
+  // additional unit in the order repeats that same per-piece weight,
+  // not a further fraction of it.
+  const effectivePiecesPerUnit = Math.max(1, Number(piecesPerUnit) || 1);
+  const pesoPorPieza = pesoTotalLbs / effectivePiecesPerUnit; // 0 stays 0 — no fake fallback
 
   const piezasXml = Array.from({ length: n }, (_, i) => `<tns:Pieza>
             <tns:NumeroPieza>${i + 1}</tns:NumeroPieza>

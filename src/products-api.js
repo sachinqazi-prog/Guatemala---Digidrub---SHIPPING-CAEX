@@ -53,7 +53,15 @@ export async function getCantidadDePiezas(sku) {
   try {
     const { data } = await axios.get(PRODUCTS_PROXY_URL, {
       params: { sku, key: PRODUCTS_PROXY_KEY },
-      timeout: 10000,
+      // Confirmed via direct testing: this proxy call genuinely takes
+      // ~11-12 seconds round trip (Render -> proxy -> 186.189.221.19
+      // -> back), since it's doing strictly more work than a direct
+      // connection would (an extra network hop). A 10s timeout was
+      // cutting this off ~1-2 seconds before it would have succeeded
+      // on every real order tested. The order-paid webhook already
+      // has generous headroom elsewhere (the invoice-UUID retry loop
+      // alone runs up to ~40s), so a longer timeout here is safe.
+      timeout: 20000,
     });
 
     if (!data?.ok) {

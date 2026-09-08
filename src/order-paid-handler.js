@@ -137,7 +137,7 @@ async function buildLineItemGuidePayloads(order) {
   const payloads = await Promise.all(
     shippableItems.map(async (item, index) => {
       const productNumber = String(index + 1).padStart(2, '0');
-      const pesoTotalKg = item?.grams ? item.grams / 1000 : 1;
+      const pesoTotalKg = (item?.grams || 0) / 1000; // 0 stays 0 — no fake fallback
 
       // Per CAEX's spec (Point 9): n = Cantidad_de_piezas from the
       // Products API. That field describes how many physical

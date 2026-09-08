@@ -165,7 +165,18 @@ export async function generateGuide({
 }) {
   const recoleccionId = `${orderNumber}-${productNumber}`;
   const n = Math.max(1, Number(cantidadPiezas) || 1);
-  const pesoPorPieza = (Number(pesoTotalKg) || 1) / n;
+  // CAEX's GenerarGuia field is PesoPieza, and the printed labels
+  // confirm it's treated as LBS with no conversion of its own — a
+  // real order (#1146) sent 71.21 (meant as kg, from Shopify's grams
+  // field converted to kg) and the label printed "71.21 lbs" verbatim,
+  // understating the bed's real ~157lb weight by roughly half. Since
+  // pesoTotalKg arrives here in KILOGRAMS (converted from Shopify's
+  // grams field in order-paid-handler.js), it must be converted to
+  // pounds here before being divided/sent, or every real-weight label
+  // silently shows the wrong unit.
+  const KG_TO_LBS = 2.20462;
+  const pesoTotalLbs = (Number(pesoTotalKg) || 0) * KG_TO_LBS;
+  const pesoPorPieza = pesoTotalLbs / n; // 0 stays 0 — no fake fallback
 
   const piezasXml = Array.from({ length: n }, (_, i) => `<tns:Pieza>
             <tns:NumeroPieza>${i + 1}</tns:NumeroPieza>

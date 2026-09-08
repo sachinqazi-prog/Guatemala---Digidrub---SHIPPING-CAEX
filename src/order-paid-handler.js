@@ -67,13 +67,9 @@ function noteAttributesMap(order) {
  *   Details showed NIT: 2241839151202). Using notes['NIT'] here, with
  *   'CF' as fallback if absent — CONFIRM this note attribute key name
  *   is right; if guides still fail on NIT, check the exact key.
- * - ReferenciaCliente2 (Invoice UUID): spec says this must be the FEL
- *   invoice UUID, which lives in the SEPARATE certification/invoicing
- *   service, not this shipping middleware. No confirmed way to fetch
- *   it here yet — sending empty string as a placeholder. This should
- *   be revisited: either that service needs to write the UUID onto the
- *   order (e.g. as a note attribute, similar to NIT/_caex_poblado_id),
- *   or this handler needs to call that service's API directly.
+ * - ReferenciaCliente2 (Invoice UUID): now correctly sourced from the
+ *   "Invoice UUID" note attribute written back by the invoicing
+ *   service — confirmed working on real orders (#1142, #1143).
  * - Cantidad_de_piezas / weight ("Ashley Direct"): spec says piece
  *   count comes from a Products API and weight from "Ashley Direct" —
  *   neither is integrated here. Falling back to 1 piece, weight from
@@ -338,7 +334,7 @@ async function processGuideGeneration(order, meta) {
     if (fulfillmentOrders.length === 0) {
       log.warn('Guide(s) created but no fulfillment order found after retries', {
         orderId,
-        trackingNumbers: successes.map((s) => s.result.trackingNumber),
+        trackingNumbers: successes.flatMap((s) => s.result.pieces.map((p) => p.trackingNumber)),
       });
       return;
     }
@@ -358,13 +354,24 @@ async function processGuideGeneration(order, meta) {
       }
     }
 
-    // One Shopify fulfillment PER successful CAEX guide, each scoped to
-    // just that product, each with its own single tracking number.
-    // This matches how Shopify actually displays multiple trackings on
-    // one order (one fulfillment card per shipment) — trying to cram
-    // several tracking numbers into one fulfillment via plural fields
-    // isn't supported by this API and was silently producing no
-    // tracking info at all on multi-item orders.
+    // One Shopify fulfillment PER successful CAEX guide (i.e. per
+    // PRODUCT/line item), each scoped to just that product. This
+    // matches how Shopify actually displays multiple trackings on one
+    // order (one fulfillment card per product) — trying to cram several
+    // DIFFERENT PRODUCTS' tracking numbers into one fulfillment isn't
+    // supported by this API.
+    //
+    // WITHIN a single product's fulfillment, though, CAEX can return
+    // MULTIPLE tracking numbers when cantidadPiezas > 1 — confirmed on
+    // order #1143, where a 3-unit line item came back as 3 separately
+    // labeled/tracked CAEX shipments (result.pieces has 3 entries). An
+    // earlier version of this handler only ever read a single
+    // trackingNumber/trackingUrl off the result, so 2 of the 3 real
+    // tracking numbers were silently dropped and never reached Shopify.
+    // Now every piece's tracking number/URL is collected and passed to
+    // createFulfillmentWithTracking, which uses Shopify's GraphQL
+    // fulfillmentCreateV2 mutation to attach all of them to the one
+    // fulfillment for this line item.
     const fulfilled = [];
     const unmatched = [];
     for (const { payload, result } of successes) {
@@ -373,26 +380,29 @@ async function processGuideGeneration(order, meta) {
         log.warn('No matching fulfillment-order line item found for CAEX guide — skipping', {
           orderId,
           lineItemId: payload.lineItemId,
-          trackingNumber: result.trackingNumber,
+          trackingNumbers: result.pieces.map((p) => p.trackingNumber),
         });
-        unmatched.push(result.trackingNumber);
+        unmatched.push(...result.pieces.map((p) => p.trackingNumber));
         continue;
       }
+
+      const trackingNumbers = result.pieces.map((p) => p.trackingNumber).filter(Boolean);
+      const trackingUrls = result.pieces.map((p) => p.trackingUrl).filter(Boolean);
 
       try {
         await createFulfillmentWithTracking({
           orderId,
           fulfillmentOrderId: match.fulfillmentOrderId,
           fulfillmentOrderLineItems: [{ id: match.focLineItemId, quantity: match.quantity }],
-          trackingNumber: result.trackingNumber,
-          trackingUrl: result.trackingUrl,
+          trackingNumbers,
+          trackingUrls,
         });
-        fulfilled.push(result.trackingNumber);
+        fulfilled.push(...trackingNumbers);
       } catch (err) {
         log.error('createFulfillmentWithTracking failed for line item', {
           orderId,
           lineItemId: payload.lineItemId,
-          trackingNumber: result.trackingNumber,
+          trackingNumbers,
           ...describeAxiosError(err),
         });
       }

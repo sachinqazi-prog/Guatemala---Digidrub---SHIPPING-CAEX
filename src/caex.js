@@ -130,22 +130,6 @@ export async function getPoblados(codigoDepartamento) {
 }
 
 /**
- * Returns tomorrow's date as an ISO string, at a reasonable business
- * hour (9am). CAEX was rejecting requests with FechaRecoleccion set to
- * the current moment with "Poblados no se puede entregar en el mismo
- * dia" (can't deliver same-day) — happened consistently across
- * different towns and different TipoEntrega values, so the pickup DATE
- * itself (today) was the trigger, not the service type. Defaulting to
- * tomorrow avoids asking CAEX for same-day service at all.
- */
-function tomorrowAt9am() {
-  const d = new Date();
-  d.setDate(d.getDate() + 1);
-  d.setHours(9, 0, 0, 0);
-  return d.toISOString();
-}
-
-/**
  * Generate ONE shipping guide for ONE invoiced line item.
  *
  * Per CAEX's own official spec (PDF supplied by CAEX support,
@@ -154,11 +138,16 @@ function tomorrowAt9am() {
  * products, call this function 2+ times — see order-paid-handler.js's
  * processGuideGeneration for the loop.
  *
- * This replaces an earlier version that (a) called this once per
- * order, (b) guessed at several field names/values never confirmed
- * against real documentation, and (c) sent an extra <TokenDireccion>
- * element that doesn't exist in CAEX's real schema at all. Every field
- * below is now mapped exactly to CAEX's spec — see the comment on each.
+ * IMPORTANT (confirmed via real order #1143, 3-unit line item):
+ * when cantidadPiezas > 1, CAEX does NOT return a single guide
+ * covering all pieces. It returns ONE SEPARATE DatosRecoleccion per
+ * piece, each with its own NumeroGuia/URLRecoleccion/URLConsulta —
+ * i.e. n physically separate labeled shipments for n pieces of the
+ * same product. An earlier version of this function kept only
+ * `recolecciones[0]`, silently discarding tracking numbers for every
+ * piece beyond the first. This version returns ALL of them — callers
+ * (order-paid-handler.js / shopify.js) are responsible for attaching
+ * every tracking number to the Shopify fulfillment, not just one.
  */
 export async function generateGuide({
   orderNumber,       // Shopify order number, e.g. "202601"
@@ -181,7 +170,7 @@ export async function generateGuide({
   const piezasXml = Array.from({ length: n }, (_, i) => `<tns:Pieza>
             <tns:NumeroPieza>${i + 1}</tns:NumeroPieza>
             <tns:TipoPieza>${escapeXml(process.env.CAEX_DEFAULT_PIEZA)}</tns:TipoPieza>
-            <tns:PesoPieza>${pesoPorPieza}</tns:PesoPieza>
+            <tns:PesoPieza>${pesoPorPieza.toFixed(2)}</tns:PesoPieza>
             <tns:MontoCOD>0.00</tns:MontoCOD>
           </tns:Pieza>`).join('\n          ');
 
@@ -263,15 +252,33 @@ export async function generateGuide({
   let recolecciones = result?.ListaRecolecciones?.DatosRecoleccion;
   recolecciones = Array.isArray(recolecciones) ? recolecciones : recolecciones ? [recolecciones] : [];
 
-  const first = recolecciones[0] || {};
+  if (recolecciones.length === 0) {
+    return {
+      success: false,
+      error: 'CAEX reported success but returned no DatosRecoleccion entries',
+      raw: result,
+    };
+  }
+
+  // One entry per PIECE, not per product — e.g. cantidadPiezas=3 returns
+  // 3 entries here, each a separately labeled/tracked CAEX shipment.
+  const pieces = recolecciones.map((r) => ({
+    numeroPieza: r.NumeroPieza,
+    trackingNumber: r.NumeroGuia,
+    // Per CAEX's spec: URLRecoleccion is the PDF with the generated
+    // shipping label — this is what should be saved, not URLConsulta.
+    trackingUrl: r.URLRecoleccion || null,
+  }));
 
   return {
     success: true,
     recoleccionId,
-    trackingNumber: first.NumeroGuia,
-    // Per CAEX's spec: URLRecoleccion is the PDF with the generated
-    // shipping label — this is what should be saved, not URLConsulta.
-    trackingUrl: first.URLRecoleccion || null,
+    // Backward-compatible single values (first piece) — some older
+    // callers may still read these directly. New code should use
+    // `pieces` to get every tracking number/URL when n > 1.
+    trackingNumber: pieces[0].trackingNumber,
+    trackingUrl: pieces[0].trackingUrl,
+    pieces,
     raw: result,
   };
 }

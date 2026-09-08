@@ -174,7 +174,10 @@ export async function createFulfillmentWithTracking({
   const urls = trackingUrls && trackingUrls.length ? trackingUrls : [trackingUrl].filter(Boolean);
 
   const lineItems = fulfillmentOrderLineItems
-    ? fulfillmentOrderLineItems.map((li) => ({ id: li.id, quantity: li.quantity }))
+    ? fulfillmentOrderLineItems.map((li) => ({
+        id: `gid://shopify/FulfillmentOrderLineItem/${li.id}`,
+        quantity: li.quantity,
+      }))
     : undefined;
 
   const lineItemsByFulfillmentOrder = {
@@ -219,6 +222,28 @@ export async function createFulfillmentWithTracking({
       client.post('/graphql.json', { query, variables })
     );
 
+    // GraphQL has TWO distinct error channels, and they must both be
+    // checked or a real failure can look like success:
+    //   1. Top-level `errors` — schema/argument problems (e.g. a
+    //      malformed gid, missing scope). These mean the mutation
+    //      never ran at all; `data.data` is typically null.
+    //   2. `userErrors` inside the mutation payload — business-logic
+    //      rejections (e.g. "already fulfilled") that DID run the
+    //      mutation but declined the action.
+    // An earlier version of this function only checked #2, so a
+    // malformed-ID top-level error (confirmed on order #1144 — line
+    // item IDs were sent as bare numbers instead of
+    // gid://shopify/FulfillmentOrderLineItem/{id}) resulted in `data`
+    // being null, `userErrors` defaulting to an empty array, nothing
+    // throwing, and the caller logging the tracking numbers as
+    // successfully fulfilled — while Shopify's order page still showed
+    // Unfulfilled. Both channels must throw now.
+    if (data?.errors?.length) {
+      const err = new Error(`Shopify GraphQL error: ${data.errors.map((e) => e.message).join('; ')}`);
+      err.shopifyError = data.errors;
+      throw err;
+    }
+
     const result = data?.data?.fulfillmentCreateV2;
     const userErrors = result?.userErrors || [];
 
@@ -228,7 +253,11 @@ export async function createFulfillmentWithTracking({
       throw err;
     }
 
-    return result?.fulfillment;
+    if (!result?.fulfillment) {
+      throw new Error('Shopify fulfillmentCreateV2 returned no fulfillment and no errors — unexpected response shape');
+    }
+
+    return result.fulfillment;
   } catch (err) {
     if (err.response) {
       err.shopifyError = err.shopifyError || err.response.data;

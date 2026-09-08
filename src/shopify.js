@@ -135,11 +135,30 @@ export async function getOrder(orderId) {
  * fulfillmentOrderLineItems so Shopify shows a separate fulfillment
  * card with its own tracking number per product.
  *
+ * ADDITIONALLY (confirmed via real order #1143): when a single line
+ * item has cantidadPiezas > 1, CAEX returns MULTIPLE tracking numbers
+ * for that ONE product — one per physical piece/box. Shopify's REST
+ * fulfillments endpoint genuinely only accepts a single tracking
+ * number per fulfillment (the plural tracking_numbers/tracking_urls
+ * REST fields are legacy and unreliable — confirmed via Shopify's own
+ * community/dev threads). The GraphQL fulfillmentCreateV2 mutation
+ * DOES properly support multiple tracking numbers on one fulfillment
+ * via trackingInfo.numbers/urls (arrays) — this is Shopify's own
+ * documented solution for exactly this case: "if you're shipping
+ * assembly parts of one furniture item in several boxes." So this
+ * function now uses GraphQL instead of REST.
+ *
  * Pass `fulfillmentOrderLineItems` (array of { id, quantity }, using
  * the FULFILLMENT ORDER's line item id, not the order's line item id)
  * to scope to specific products. Omit it to fulfill the whole
  * fulfillment order at once (single-item orders, or if scoping isn't
  * needed).
+ *
+ * Pass `trackingNumbers`/`trackingUrls` as arrays (one entry per
+ * physical piece — use caex.js's `pieces` array from generateGuide).
+ * Single-piece callers can still pass legacy `trackingNumber`/
+ * `trackingUrl` (singular) for convenience; they'll be wrapped into
+ * one-element arrays.
  */
 export async function createFulfillmentWithTracking({
   orderId,
@@ -147,32 +166,72 @@ export async function createFulfillmentWithTracking({
   fulfillmentOrderLineItems,
   trackingNumber,
   trackingUrl,
+  trackingNumbers,
+  trackingUrls,
   trackingCompany = 'CAEX',
 }) {
-  const lineItemsByFulfillmentOrder = fulfillmentOrderLineItems
-    ? { fulfillment_order_id: fulfillmentOrderId, fulfillment_order_line_items: fulfillmentOrderLineItems }
-    : { fulfillment_order_id: fulfillmentOrderId };
+  const numbers = trackingNumbers && trackingNumbers.length ? trackingNumbers : [trackingNumber].filter(Boolean);
+  const urls = trackingUrls && trackingUrls.length ? trackingUrls : [trackingUrl].filter(Boolean);
 
-  const body = {
+  const lineItems = fulfillmentOrderLineItems
+    ? fulfillmentOrderLineItems.map((li) => ({ id: li.id, quantity: li.quantity }))
+    : undefined;
+
+  const lineItemsByFulfillmentOrder = {
+    fulfillmentOrderId: `gid://shopify/FulfillmentOrder/${fulfillmentOrderId}`,
+    ...(lineItems ? { fulfillmentOrderLineItems: lineItems } : {}),
+  };
+
+  const query = `
+    mutation fulfillmentCreate($fulfillment: FulfillmentInput!) {
+      fulfillmentCreateV2(fulfillment: $fulfillment) {
+        fulfillment {
+          id
+          status
+          trackingInfo {
+            number
+            url
+            company
+          }
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const variables = {
     fulfillment: {
-      line_items_by_fulfillment_order: [lineItemsByFulfillmentOrder],
-      tracking_info: {
-        number: trackingNumber,
-        url: trackingUrl,
+      lineItemsByFulfillmentOrder: [lineItemsByFulfillmentOrder],
+      trackingInfo: {
+        numbers,
+        urls,
         company: trackingCompany,
       },
-      notify_customer: false,
+      notifyCustomer: false,
     },
   };
 
   try {
-    const { data } = await adminRequest((client) => client.post('/fulfillments.json', body));
-    return data;
+    const { data } = await adminRequest((client) =>
+      client.post('/graphql.json', { query, variables })
+    );
+
+    const result = data?.data?.fulfillmentCreateV2;
+    const userErrors = result?.userErrors || [];
+
+    if (userErrors.length > 0) {
+      const err = new Error(`Shopify fulfillmentCreateV2 error: ${userErrors.map((e) => e.message).join('; ')}`);
+      err.shopifyError = userErrors;
+      throw err;
+    }
+
+    return result?.fulfillment;
   } catch (err) {
-    // Attach Shopify's actual error body to the error so callers can log
-    // the real reason (e.g. "already fulfilled") instead of just "422".
     if (err.response) {
-      err.shopifyError = err.response.data;
+      err.shopifyError = err.shopifyError || err.response.data;
     }
     throw err;
   }

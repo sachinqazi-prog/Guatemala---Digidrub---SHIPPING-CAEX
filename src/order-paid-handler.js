@@ -7,6 +7,7 @@ import {
 } from './shopify.js';
 import { getServiceCodeMeta } from './shipping-rules.js';
 import { generateGuide } from './caex.js';
+import { getCantidadDePiezas } from './products-api.js';
 import { resolveDepartamento } from './province-mapping.js';
 import { findPobladoCode } from './poblado-lookup.js';
 import { log } from './logger.js';
@@ -76,7 +77,7 @@ function noteAttributesMap(order) {
  *   Shopify's own line_item.grams (converted to kg). Revisit once the
  *   real Products API / Ashley Direct integration is available.
  */
-function buildLineItemGuidePayloads(order) {
+async function buildLineItemGuidePayloads(order) {
   const shippingAddress = order?.shipping_address || {};
   const notes = noteAttributesMap(order);
 
@@ -130,27 +131,75 @@ function buildLineItemGuidePayloads(order) {
 
   const shippableItems = (order?.line_items || []).filter((li) => li?.requires_shipping);
 
-  return shippableItems.map((item, index) => {
-    const productNumber = String(index + 1).padStart(2, '0');
-    const pesoTotalKg = item?.grams ? item.grams / 1000 : 1;
+  // Fetch real Cantidad_de_piezas per line item IN PARALLEL — one call
+  // per distinct SKU, cached daily inside products-api.js so this is
+  // cheap on repeat orders for the same product.
+  const payloads = await Promise.all(
+    shippableItems.map(async (item, index) => {
+      const productNumber = String(index + 1).padStart(2, '0');
+      const pesoTotalKg = item?.grams ? item.grams / 1000 : 1;
 
-    return {
-      lineItemId: item.id, // needed to scope the Shopify fulfillment to just this product
-      quantity: item.quantity,
-      orderNumber,
-      productNumber,
-      customerName,
-      address1,
-      phone,
-      nit,
-      sku: item?.sku || '',
-      productName: item?.name || item?.title || '',
-      invoiceUuid,
-      destPobladoCode,
-      cantidadPiezas: item.quantity || 1, // uses the real ordered quantity — TODO: replace with Products API's actual Cantidad_de_piezas once available, in case a single unit legitimately ships as multiple physical pieces
-      pesoTotalKg,
-    };
-  });
+      // Per CAEX's spec (Point 9): n = Cantidad_de_piezas from the
+      // Products API. That field describes how many physical
+      // pieces/boxes ONE UNIT of this product ships as (e.g. SKU
+      // 428628 "COMEDOR BRECKINGTON" = 5 pieces per unit — confirmed
+      // via a real API call). The TOTAL piece count for this line
+      // item is therefore that value MULTIPLIED BY the ordered
+      // quantity, not quantity alone. An earlier version of this
+      // handler used item.quantity as a stand-in for n, which was
+      // flagged as a known gap: it silently undercounts pieces for
+      // any multi-piece product whenever cantidad_de_piezas > 1,
+      // producing a CAEX guide for fewer boxes than actually ship —
+      // a real risk of an incomplete pickup/delivery going unnoticed
+      // since nothing about that failure mode throws an error
+      // anywhere in this pipeline.
+      //
+      // Falls back to item.quantity alone (the old behavior) if the
+      // Products API is unreachable or returns nothing usable for
+      // this SKU — logged loudly either way, matching the existing
+      // NIT/invoice-UUID fallback pattern in this file. A flaky
+      // external dependency should degrade guide accuracy, not block
+      // guide generation entirely.
+      const realPiecesPerUnit = await getCantidadDePiezas(item?.sku);
+      let cantidadPiezas;
+      if (realPiecesPerUnit) {
+        cantidadPiezas = realPiecesPerUnit * (item.quantity || 1);
+        log.info('Using real Cantidad_de_piezas from Products API', {
+          orderId: order.id,
+          sku: item?.sku,
+          piecesPerUnit: realPiecesPerUnit,
+          quantity: item.quantity,
+          totalPieces: cantidadPiezas,
+        });
+      } else {
+        cantidadPiezas = item.quantity || 1;
+        log.warn('No real Cantidad_de_piezas available — falling back to ordered quantity alone', {
+          orderId: order.id,
+          sku: item?.sku,
+          quantity: item.quantity,
+        });
+      }
+
+      return {
+        lineItemId: item.id, // needed to scope the Shopify fulfillment to just this product
+        quantity: item.quantity,
+        orderNumber,
+        productNumber,
+        customerName,
+        address1,
+        phone,
+        nit,
+        sku: item?.sku || '',
+        productName: item?.name || item?.title || '',
+        invoiceUuid,
+        destPobladoCode,
+        cantidadPiezas,
+        pesoTotalKg,
+      };
+    })
+  );
+
+  return payloads;
 }
 
 /**
@@ -279,7 +328,7 @@ async function processGuideGeneration(order, meta) {
       freshOrder = await getOrder(orderId);
     }
 
-    const lineItemPayloads = buildLineItemGuidePayloads(freshOrder);
+    const lineItemPayloads = await buildLineItemGuidePayloads(freshOrder);
     if (lineItemPayloads.length === 0) {
       log.warn('No shippable line items found on order — nothing to generate', { orderId });
       return;

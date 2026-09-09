@@ -165,7 +165,16 @@ async function buildLineItemGuidePayloads(order) {
       let piecesPerUnit;
       if (realPiecesPerUnit) {
         piecesPerUnit = realPiecesPerUnit;
-        cantidadPiezas = realPiecesPerUnit * (item.quantity || 1);
+        // cantidadPiezas = MAX(piecesPerUnit, quantity), not
+        // piecesPerUnit × quantity. Example: 5 pieces/unit × 2 units
+        // ordered → 5 total pieces sent to CAEX (not 10). This is a
+        // deliberate choice, not a physical-accuracy claim — CAEX
+        // still physically needs to collect piecesPerUnit × quantity
+        // real boxes for a multi-piece product ordered in quantity>1;
+        // this formula caps the guide/tracking-number count at
+        // whichever of the two numbers is larger instead of their
+        // product.
+        cantidadPiezas = Math.max(realPiecesPerUnit, item.quantity || 1);
         log.info('Using real Cantidad_de_piezas from Products API', {
           orderId: order.id,
           sku: item?.sku,

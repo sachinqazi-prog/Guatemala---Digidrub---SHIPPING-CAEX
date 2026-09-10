@@ -139,58 +139,67 @@ async function buildLineItemGuidePayloads(order) {
       const productNumber = String(index + 1).padStart(2, '0');
       const pesoTotalKg = (item?.grams || 0) / 1000; // 0 stays 0 — no fake fallback
 
-      // Per CAEX's spec (Point 9): n = Cantidad_de_piezas from the
-      // Products API. That field describes how many physical
-      // pieces/boxes ONE UNIT of this product ships as (e.g. SKU
-      // 428628 "COMEDOR BRECKINGTON" = 5 pieces per unit — confirmed
-      // via a real API call). The TOTAL piece count for this line
-      // item is therefore that value MULTIPLIED BY the ordered
-      // quantity, not quantity alone. An earlier version of this
-      // handler used item.quantity as a stand-in for n, which was
-      // flagged as a known gap: it silently undercounts pieces for
-      // any multi-piece product whenever cantidad_de_piezas > 1,
-      // producing a CAEX guide for fewer boxes than actually ship —
-      // a real risk of an incomplete pickup/delivery going unnoticed
-      // since nothing about that failure mode throws an error
-      // anywhere in this pipeline.
+      // ─────────────────────────────────────────────────────────────
+      // GUIDE / TRACKING-NUMBER COUNT RULE
       //
-      // Falls back to item.quantity alone (the old behavior) if the
-      // Products API is unreachable or returns nothing usable for
-      // this SKU — logged loudly either way, matching the existing
-      // NIT/invoice-UUID fallback pattern in this file. A flaky
-      // external dependency should degrade guide accuracy, not block
-      // guide generation entirely.
+      // cantidadPiezas = piecesPerUnit  (ordered QUANTITY is IGNORED)
+      //
+      //   piecesPerUnit | quantity | guides generated
+      //   ------------- | -------- | ----------------
+      //        1        |    1     |        1
+      //        1        |   >1     |        1
+      //        n        |    1     |        n
+      //        n        |   >1     |        n
+      //
+      // An n-piece product ALWAYS generates exactly n CAEX guides,
+      // regardless of how many units are ordered. A 1-piece product
+      // ALWAYS generates exactly 1 guide. This holds independently per
+      // line item, so a multi-product order simply applies the rule to
+      // each product using that product's own piecesPerUnit.
+      //
+      // DELIBERATE BUSINESS RULE, NOT a physical-accuracy claim: CAEX
+      // still physically has to collect piecesPerUnit × quantity real
+      // boxes for a multi-piece product ordered in quantity > 1, but
+      // only piecesPerUnit tracking numbers are issued. For a 1-piece
+      // product ordered at quantity > 1, the extra units ship under the
+      // single tracking number with no tracking of their own. This was
+      // an explicit instruction.
+      //
+      // piecesPerUnit is tracked separately from cantidadPiezas because
+      // it (not the guide count) is the correct divisor for per-box
+      // weight downstream — weight must never be split just because
+      // more than one unit was ordered.
+      // ─────────────────────────────────────────────────────────────
       const realPiecesPerUnit = await getCantidadDePiezas(item?.sku);
       let cantidadPiezas;
       let piecesPerUnit;
       if (realPiecesPerUnit) {
         piecesPerUnit = realPiecesPerUnit;
-        // cantidadPiezas = MAX(piecesPerUnit, quantity), not
-        // piecesPerUnit × quantity. Example: 5 pieces/unit × 2 units
-        // ordered → 5 total pieces sent to CAEX (not 10). This is a
-        // deliberate choice, not a physical-accuracy claim — CAEX
-        // still physically needs to collect piecesPerUnit × quantity
-        // real boxes for a multi-piece product ordered in quantity>1;
-        // this formula caps the guide/tracking-number count at
-        // whichever of the two numbers is larger instead of their
-        // product.
-        cantidadPiezas = Math.max(realPiecesPerUnit, item.quantity || 1);
+        cantidadPiezas = realPiecesPerUnit; // quantity intentionally ignored
         log.info('Using real Cantidad_de_piezas from Products API', {
           orderId: order.id,
           sku: item?.sku,
           piecesPerUnit: realPiecesPerUnit,
           quantity: item.quantity,
-          totalPieces: cantidadPiezas,
+          labelsToGenerate: cantidadPiezas,
         });
       } else {
-        // Unknown sub-boxing — treat each ordered unit as ONE piece
-        // (piecesPerUnit=1), so weight is never divided just because
-        // more than one unit was ordered. cantidadPiezas still equals
-        // quantity here (one <Pieza> entry per unit), but each entry
-        // gets the FULL per-unit weight, not a fraction of it.
+        // Products API gave nothing usable for this SKU (proxy blip,
+        // SKU not found, or a bad/zero value). Fall back to ONE guide,
+        // matching the rule's treatment of a 1-piece product.
+        //
+        // KNOWN RISK — logged at ERROR so it is ALERTABLE: if this SKU
+        // is genuinely multi-piece (e.g. 428628 = 5) and the fallback
+        // fired only because of a TRANSIENT proxy/Products-API timeout,
+        // this silently issues 1 guide for a product that should have
+        // had several. That is the #1168 failure mode, now capped at a
+        // single guide rather than `quantity`. The real defense against
+        // this is the products_proxy.php token-cache + timeout fixes
+        // (so the proxy stops crossing Render's client timeout); this
+        // ERROR log is the tripwire, not the cure.
         piecesPerUnit = 1;
-        cantidadPiezas = item.quantity || 1;
-        log.warn('No real Cantidad_de_piezas available — falling back to ordered quantity alone', {
+        cantidadPiezas = 1;
+        log.error('No real Cantidad_de_piezas available — falling back to 1 guide (quantity ignored)', {
           orderId: order.id,
           sku: item?.sku,
           quantity: item.quantity,

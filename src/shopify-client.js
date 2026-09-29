@@ -5,7 +5,7 @@ import { cacheGet, cacheSet } from './cache.js';
 // How long a product's metafields stay cached before we re-fetch from
 // Shopify. costo_de_envio changes rarely, so this trades a bit of
 // staleness for a checkout that doesn't wait on the Admin API.
-const METAFIELD_CACHE_TTL_SECONDS = Number(process.env.METAFIELD_CACHE_TTL_SECONDS || 3600);
+const METAFIELD_CACHE_TTL_SECONDS = Number(process.env.METAFIELD_CACHE_TTL_SECONDS || 300);
 
 const SHOP = process.env.SHOPIFY_SHOP;
 const CLIENT_ID = process.env.SHOPIFY_CLIENT_ID;

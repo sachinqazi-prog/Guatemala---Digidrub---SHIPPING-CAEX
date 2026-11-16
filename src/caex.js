@@ -177,7 +177,32 @@ export async function generateGuide({
   // pounds here before being divided/sent, or every real-weight label
   // silently shows the wrong unit.
   const KG_TO_LBS = 2.20462;
-  const pesoTotalLbs = (Number(pesoTotalKg) || 0) * KG_TO_LBS;
+
+  // WEIGHT FALLBACK — CAEX production rejects any guide whose PesoPieza
+  // is not positive ("El Peso debe ser Positivo!", seen on order #1189,
+  // whose product had no weight set in Shopify). QA accepted 0, so this
+  // only surfaced after switching to production. To make sure a guide
+  // is never rejected for weight:
+  //   1. Use the product's real Shopify weight when it is > 0.
+  //   2. Otherwise use CAEX_DEFAULT_PESO_KG (weight of ONE unit, in kg)
+  //      and log a WARN naming the SKU so the product can be fixed.
+  //   3. Finally, never send less than CAEX_MIN_PESO_PIEZA_LBS per piece.
+  // Real Shopify weights always win; the fallback only fills gaps.
+  const defaultPesoUnidadKg = positiveNumber(process.env.CAEX_DEFAULT_PESO_KG, 1);
+  const minPesoPiezaLbs = positiveNumber(process.env.CAEX_MIN_PESO_PIEZA_LBS, 1);
+
+  let pesoUnidadKg = Number(pesoTotalKg);
+  if (!Number.isFinite(pesoUnidadKg) || pesoUnidadKg <= 0) {
+    log.warn('Product has no weight in Shopify — using CAEX_DEFAULT_PESO_KG fallback. Set the real weight on this product.', {
+      recoleccionId,
+      sku,
+      productName,
+      shopifyWeightKg: pesoTotalKg,
+      fallbackKg: defaultPesoUnidadKg,
+    });
+    pesoUnidadKg = defaultPesoUnidadKg;
+  }
+  const pesoTotalLbs = pesoUnidadKg * KG_TO_LBS;
 
   // IMPORTANT: weight divides by piecesPerUnit (how many boxes ONE
   // UNIT physically ships as), NOT by n (which also folds in the
@@ -194,7 +219,18 @@ export async function generateGuide({
   // additional unit in the order repeats that same per-piece weight,
   // not a further fraction of it.
   const effectivePiecesPerUnit = Math.max(1, Number(piecesPerUnit) || 1);
-  const pesoPorPieza = pesoTotalLbs / effectivePiecesPerUnit; // 0 stays 0 — no fake fallback
+  const pesoPorPiezaCalculado = pesoTotalLbs / effectivePiecesPerUnit;
+  // Floor per piece, so a light product split into several boxes can
+  // never round down to 0.00 either.
+  const pesoPorPieza = Math.max(minPesoPiezaLbs, pesoPorPiezaCalculado);
+  if (pesoPorPieza !== pesoPorPiezaCalculado) {
+    log.warn('Per-piece weight below CAEX_MIN_PESO_PIEZA_LBS — sending the minimum instead', {
+      recoleccionId,
+      sku,
+      calculatedLbs: Number(pesoPorPiezaCalculado.toFixed(2)),
+      sentLbs: pesoPorPieza,
+    });
+  }
 
   const piezasXml = Array.from({ length: n }, (_, i) => `<tns:Pieza>
             <tns:NumeroPieza>${i + 1}</tns:NumeroPieza>
@@ -244,7 +280,8 @@ export async function generateGuide({
   </soap:Body>
 </soap:Envelope>`;
 
-  log.info('CAEX GenerarGuia outgoing request', envelope);
+  // Never write the CAEX password to the logs.
+  log.info('CAEX GenerarGuia outgoing request', maskPassword(envelope));
 
   const url = process.env.CAEX_URL;
   const soapAction = `"${CAEX_NS}/GenerarGuia"`;
@@ -310,6 +347,15 @@ export async function generateGuide({
     pieces,
     raw: result,
   };
+}
+
+function positiveNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+function maskPassword(xml) {
+  return String(xml).replace(/(<(?:tns:)?Password>)[^<]*(<\/(?:tns:)?Password>)/g, '$1***$2');
 }
 
 function escapeXml(value) {

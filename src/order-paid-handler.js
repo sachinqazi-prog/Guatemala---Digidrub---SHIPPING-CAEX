@@ -13,37 +13,47 @@ import { resolveDepartamento } from './province-mapping.js';
 import { findPobladoCode } from './poblado-lookup.js';
 import { log } from './logger.js';
 
-// Box count stored on each Shopify product by the ashley-sync-guatemala
-// product sync (Ashley API 2 → numberOfBoxes). Confirmed Nov 2026 to match
-// API 1's Cantidad_de_piezas on known SKUs (428628 = 5, 433091 = 5,
-// 402332 = 1). Override with PIECES_METAFIELD="namespace.key" if needed.
-const PIECES_METAFIELD = process.env.PIECES_METAFIELD || 'custom.number_of_boxes';
+// Box count stored on each Shopify product (metafield definition
+// "numberofPieces", key custom.numberofpieces — single line text, e.g. "5").
+// Confirmed Nov 2026 to match Ashley API 1's Cantidad_de_piezas on known
+// SKUs (428628 = 5, 433091 = 5, 402332 = 1, B697 Porter queen bed = 5).
+// custom.number_of_boxes (written by the product sync from Ashley API 2)
+// is checked second. Override the list with
+// PIECES_METAFIELD="namespace.key,namespace.key" if the keys ever change.
+const PIECES_METAFIELDS = (process.env.PIECES_METAFIELD || 'custom.numberofpieces,custom.number_of_boxes')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 /**
- * Reads the box count from the product's Shopify metafield.
- * Returns a positive integer, or null if missing/blank/not a number.
+ * Reads the box count from the product's Shopify metafields, trying each
+ * key in PIECES_METAFIELDS in order. Returns { pieces, key } with a
+ * positive integer, or null if none is set to a usable number.
  * Fast and independent of Ashley's servers — getProductMetafields() is the
  * same cached Admin API call checkout already uses for costo_de_envio.
  */
 async function getBoxesFromMetafield(productId) {
   if (!productId) return null;
-  const [namespace, key] = PIECES_METAFIELD.split('.');
   const metafields = await getProductMetafields(productId); // returns [] on any error
-  const mf = metafields.find((m) => m.namespace === namespace && m.key === key);
-  const match = String(mf?.value ?? '').match(/^\s*(\d+)/); // "5", "5 cajas" -> 5
-  const n = match ? parseInt(match[1], 10) : NaN;
-  return Number.isInteger(n) && n > 0 ? n : null;
+  for (const fullKey of PIECES_METAFIELDS) {
+    const [namespace, key] = fullKey.split('.');
+    const mf = metafields.find((m) => m.namespace === namespace && m.key === key);
+    const match = String(mf?.value ?? '').match(/^\s*(\d+)/); // "5", "5 cajas" -> 5
+    const n = match ? parseInt(match[1], 10) : NaN;
+    if (Number.isInteger(n) && n > 0) return { pieces: n, key: fullKey };
+  }
+  return null;
 }
 
 /**
  * How many boxes ONE UNIT of this product ships as.
- *   1. Shopify product metafield custom.number_of_boxes (instant, no Ashley call)
+ *   1. Shopify product metafield custom.numberofpieces (then custom.number_of_boxes) — instant, no Ashley call
  *   2. Ashley Products API via the cPanel proxy (slow; only if 1 is missing)
  *   3. null → caller falls back to 1 guide
  */
 async function resolvePiecesPerUnit(item) {
   const fromMetafield = await getBoxesFromMetafield(item?.product_id);
-  if (fromMetafield) return { pieces: fromMetafield, source: `metafield ${PIECES_METAFIELD}` };
+  if (fromMetafield) return { pieces: fromMetafield.pieces, source: `metafield ${fromMetafield.key}` };
 
   const fromApi = await getCantidadDePiezas(item?.sku);
   if (fromApi) return { pieces: fromApi, source: 'Products API (proxy)' };
@@ -171,7 +181,7 @@ async function buildLineItemGuidePayloads(order) {
   const shippableItems = (order?.line_items || []).filter((li) => li?.requires_shipping);
 
   // Resolve each line item's box count IN PARALLEL — from the product's
-  // number_of_boxes metafield first (fast), falling back to the Products
+  // numberofPieces metafield first (fast), falling back to the Products
   // API proxy only when the metafield is empty.
   const payloads = await Promise.all(
     shippableItems.map(async (item, index) => {
@@ -224,7 +234,7 @@ async function buildLineItemGuidePayloads(order) {
           labelsToGenerate: cantidadPiezas,
         });
       } else {
-        // Neither the number_of_boxes metafield nor the Products API gave
+        // Neither the numberofPieces metafield nor the Products API gave
         // a usable value for this SKU (metafield blank, proxy blip,
         // SKU not found, or a bad/zero value). Fall back to ONE guide,
         // matching the rule's treatment of a 1-piece product.
@@ -240,7 +250,7 @@ async function buildLineItemGuidePayloads(order) {
         // ERROR log is the tripwire, not the cure.
         piecesPerUnit = 1;
         cantidadPiezas = 1;
-        log.error('No box count available (metafield empty and Products API failed) — falling back to 1 guide (quantity ignored). Fill custom.number_of_boxes on this product.', {
+        log.error('No box count available (metafield empty and Products API failed) — falling back to 1 guide (quantity ignored). Fill the numberofPieces metafield (custom.numberofpieces) on this product.', {
           orderId: order.id,
           sku: item?.sku,
           productId: item?.product_id,

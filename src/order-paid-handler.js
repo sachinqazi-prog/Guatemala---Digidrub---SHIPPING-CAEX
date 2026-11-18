@@ -8,9 +8,48 @@ import {
 import { getServiceCodeMeta } from './shipping-rules.js';
 import { generateGuide } from './caex.js';
 import { getCantidadDePiezas } from './products-api.js';
+import { getProductMetafields } from './shopify-client.js';
 import { resolveDepartamento } from './province-mapping.js';
 import { findPobladoCode } from './poblado-lookup.js';
 import { log } from './logger.js';
+
+// Box count stored on each Shopify product by the ashley-sync-guatemala
+// product sync (Ashley API 2 → numberOfBoxes). Confirmed Nov 2026 to match
+// API 1's Cantidad_de_piezas on known SKUs (428628 = 5, 433091 = 5,
+// 402332 = 1). Override with PIECES_METAFIELD="namespace.key" if needed.
+const PIECES_METAFIELD = process.env.PIECES_METAFIELD || 'custom.number_of_boxes';
+
+/**
+ * Reads the box count from the product's Shopify metafield.
+ * Returns a positive integer, or null if missing/blank/not a number.
+ * Fast and independent of Ashley's servers — getProductMetafields() is the
+ * same cached Admin API call checkout already uses for costo_de_envio.
+ */
+async function getBoxesFromMetafield(productId) {
+  if (!productId) return null;
+  const [namespace, key] = PIECES_METAFIELD.split('.');
+  const metafields = await getProductMetafields(productId); // returns [] on any error
+  const mf = metafields.find((m) => m.namespace === namespace && m.key === key);
+  const match = String(mf?.value ?? '').match(/^\s*(\d+)/); // "5", "5 cajas" -> 5
+  const n = match ? parseInt(match[1], 10) : NaN;
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+/**
+ * How many boxes ONE UNIT of this product ships as.
+ *   1. Shopify product metafield custom.number_of_boxes (instant, no Ashley call)
+ *   2. Ashley Products API via the cPanel proxy (slow; only if 1 is missing)
+ *   3. null → caller falls back to 1 guide
+ */
+async function resolvePiecesPerUnit(item) {
+  const fromMetafield = await getBoxesFromMetafield(item?.product_id);
+  if (fromMetafield) return { pieces: fromMetafield, source: `metafield ${PIECES_METAFIELD}` };
+
+  const fromApi = await getCantidadDePiezas(item?.sku);
+  if (fromApi) return { pieces: fromApi, source: 'Products API (proxy)' };
+
+  return { pieces: null, source: null };
+}
 
 function verifyShopifyWebhook(req) {
   const secret = process.env.SHOPIFY_WEBHOOK_SECRET;
@@ -131,9 +170,9 @@ async function buildLineItemGuidePayloads(order) {
 
   const shippableItems = (order?.line_items || []).filter((li) => li?.requires_shipping);
 
-  // Fetch real Cantidad_de_piezas per line item IN PARALLEL — one call
-  // per distinct SKU, cached daily inside products-api.js so this is
-  // cheap on repeat orders for the same product.
+  // Resolve each line item's box count IN PARALLEL — from the product's
+  // number_of_boxes metafield first (fast), falling back to the Products
+  // API proxy only when the metafield is empty.
   const payloads = await Promise.all(
     shippableItems.map(async (item, index) => {
       const productNumber = String(index + 1).padStart(2, '0');
@@ -170,21 +209,23 @@ async function buildLineItemGuidePayloads(order) {
       // weight downstream — weight must never be split just because
       // more than one unit was ordered.
       // ─────────────────────────────────────────────────────────────
-      const realPiecesPerUnit = await getCantidadDePiezas(item?.sku);
+      const { pieces: realPiecesPerUnit, source: piecesSource } = await resolvePiecesPerUnit(item);
       let cantidadPiezas;
       let piecesPerUnit;
       if (realPiecesPerUnit) {
         piecesPerUnit = realPiecesPerUnit;
         cantidadPiezas = realPiecesPerUnit; // quantity intentionally ignored
-        log.info('Using real Cantidad_de_piezas from Products API', {
+        log.info('Using real box count for guides', {
           orderId: order.id,
           sku: item?.sku,
+          source: piecesSource,
           piecesPerUnit: realPiecesPerUnit,
           quantity: item.quantity,
           labelsToGenerate: cantidadPiezas,
         });
       } else {
-        // Products API gave nothing usable for this SKU (proxy blip,
+        // Neither the number_of_boxes metafield nor the Products API gave
+        // a usable value for this SKU (metafield blank, proxy blip,
         // SKU not found, or a bad/zero value). Fall back to ONE guide,
         // matching the rule's treatment of a 1-piece product.
         //
@@ -199,9 +240,10 @@ async function buildLineItemGuidePayloads(order) {
         // ERROR log is the tripwire, not the cure.
         piecesPerUnit = 1;
         cantidadPiezas = 1;
-        log.error('No real Cantidad_de_piezas available — falling back to 1 guide (quantity ignored)', {
+        log.error('No box count available (metafield empty and Products API failed) — falling back to 1 guide (quantity ignored). Fill custom.number_of_boxes on this product.', {
           orderId: order.id,
           sku: item?.sku,
+          productId: item?.product_id,
           quantity: item.quantity,
         });
       }
